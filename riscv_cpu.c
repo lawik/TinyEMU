@@ -1041,12 +1041,20 @@ static void set_priv(RISCVCPUState *s, int priv)
     }
 }
 
+/* TEMU_TRACE=1: periodically dump CPU state and exception counts (debug aid) */
+static int temu_trace = -1;
+static uint64_t temu_exc_count[64][4];
+static uint64_t temu_last_exc_pc[64];
+
 static void raise_exception2(RISCVCPUState *s, uint32_t cause,
                              target_ulong tval)
 {
     BOOL deleg;
     target_ulong causel;
 
+    if (temu_trace > 0) {
+        temu_exc_count[cause & 63][s->priv & 3]++;
+        temu_last_exc_pc[cause & 63] = s->pc;
     }
     
 #if defined(DUMP_EXCEPTIONS) || defined(DUMP_MMU_EXCEPTIONS) || defined(DUMP_INTERRUPTS)
@@ -1232,6 +1240,26 @@ static inline uint32_t get_field1(uint32_t val, int src_pos,
 
 static void glue(riscv_cpu_interp, MAX_XLEN)(RISCVCPUState *s, int n_cycles)
 {
+    if (temu_trace < 0)
+        temu_trace = getenv("TEMU_TRACE") ? 1 : 0;
+    if (temu_trace > 0) {
+        static uint64_t calls, last_insn;
+        if ((++calls % 400) == 0) {
+            int c, p;
+            printf("[temu] insn=%" PRIu64 " (+%" PRIu64 ") pc=0x%" PRIx64 " priv=%d mstatus=0x%" PRIx64 " mie=0x%x mip=0x%x power_down=%d\n"
+                   "[temu]   mcause=0x%" PRIx64 " mepc=0x%" PRIx64 " mtval=0x%" PRIx64 " scause=0x%" PRIx64 " sepc=0x%" PRIx64 " stval=0x%" PRIx64 "\n",
+                   s->insn_counter, s->insn_counter - last_insn, (uint64_t)s->pc, s->priv, (uint64_t)s->mstatus, s->mie, s->mip, s->power_down_flag,
+                   (uint64_t)s->mcause, (uint64_t)s->mepc, (uint64_t)s->mtval, (uint64_t)s->scause, (uint64_t)s->sepc, (uint64_t)s->stval);
+            last_insn = s->insn_counter;
+            for (c = 0; c < 64; c++)
+                for (p = 0; p < 4; p++)
+                    if (temu_exc_count[c][p]) {
+                        printf("[temu]   exc cause=%d from priv=%d count=%" PRIu64 " last_pc=0x%" PRIx64 "\n", c, p, temu_exc_count[c][p], (uint64_t)temu_last_exc_pc[c]);
+                        temu_exc_count[c][p] = 0;
+                    }
+            fflush(stdout);
+        }
+    }
 #ifdef USE_GLOBAL_STATE
     s = &riscv_cpu_global_state;
 #endif
