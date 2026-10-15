@@ -1259,7 +1259,7 @@ Serial.prototype.send_chars = function(str)
 static void bios_debug_write(void *opaque, uint32_t offset,
                         uint32_t val, int size_log2)
 {
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
     static char line_buf[256];
     static int line_buf_index;
     line_buf[line_buf_index++] = val;
@@ -1925,7 +1925,7 @@ static void kvm_exec(PCMachine *s)
 }
 #endif
 
-#if defined(EMSCRIPTEN)
+#if defined(__EMSCRIPTEN__)
 /* with Javascript clock_gettime() is not enough precise enough to
    have a reliable TSC counter. XXX: increment the cycles during the
    power down time */

@@ -45,7 +45,7 @@ void __attribute__((format(printf, 1, 2))) vm_error(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
     vprintf(fmt, ap);
 #else
     vfprintf(stderr, fmt, ap);
@@ -194,7 +194,7 @@ static BOOL find_name(const char *name, const char *name_list)
 }
 
 static const VirtMachineClass *virt_machine_list[] = {
-#if defined(EMSCRIPTEN)
+#if defined(__EMSCRIPTEN__)
     /* only a single machine in the EMSCRIPTEN target */
 #ifndef CONFIG_X86EMU
     &riscv_machine_class,
@@ -446,7 +446,7 @@ char *get_file_path(const char *base_filename, const char *filename)
 }
 
 
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
 static int load_file(uint8_t **pbuf, const char *filename)
 {
     abort();

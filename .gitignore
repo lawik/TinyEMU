@@ -1,0 +1,8 @@
+*.o
+*.d
+/temu
+/js/riscvemu64-wasm.js
+/js/riscvemu64-wasm.wasm
+/js/riscvemu64.js
+/js/x86emu*.js
+/js/*.wasm

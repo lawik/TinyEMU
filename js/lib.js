@@ -22,6 +22,11 @@
  * THE SOFTWARE.
  */
 mergeInto(LibraryManager.library, {
+    $WgetState: {
+        nextHandle: 1,
+        requests: {}
+    },
+
     console_write: function(opaque, buf, len)
     {
         var str;
@@ -58,6 +63,7 @@ mergeInto(LibraryManager.library, {
         }, 50);
     },
 
+    emscripten_async_wget3_data__deps: ['$WgetState'],
     emscripten_async_wget3_data: function(url, request, user, password, post_data, post_data_len, arg, free, onload, onerror, onprogress) {
     var _url = UTF8ToString(url);
     var _request = UTF8ToString(request);
@@ -81,7 +87,7 @@ mergeInto(LibraryManager.library, {
           http.setRequestHeader("Authorization", "Basic " + btoa(_user + ':' + _password));
       }
         
-    var handle = Browser.getNextWgetRequestHandle();
+    var handle = WgetState.nextHandle++;
 
     // LOAD
     http.onload = function http_onload(e) {
@@ -94,7 +100,7 @@ mergeInto(LibraryManager.library, {
       } else {
         if (onerror) dynCall('viiii', onerror, [handle, arg, http.status, http.statusText]);
       }
-      delete Browser.wgetRequests[handle];
+      delete WgetState.requests[handle];
     };
 
     // ERROR
@@ -102,7 +108,7 @@ mergeInto(LibraryManager.library, {
       if (onerror) {
         dynCall('viiii', onerror, [handle, arg, http.status, http.statusText]);
       }
-      delete Browser.wgetRequests[handle];
+      delete WgetState.requests[handle];
     };
 
     // PROGRESS
@@ -112,7 +118,7 @@ mergeInto(LibraryManager.library, {
 
     // ABORT
     http.onabort = function http_onabort(e) {
-      delete Browser.wgetRequests[handle];
+      delete WgetState.requests[handle];
     };
 
     // Useful because the browser can limit the number of redirection
@@ -132,7 +138,7 @@ mergeInto(LibraryManager.library, {
       http.send(null);
     }
 
-    Browser.wgetRequests[handle] = http;
+    WgetState.requests[handle] = http;
 
     return handle;
   },
@@ -178,19 +184,20 @@ mergeInto(LibraryManager.library, {
   },
 
   /* file buffer API */
+  file_buffer_get_new_handle__deps: ['$WgetState'],
   file_buffer_get_new_handle: function()
   {
       var h;
-      if (typeof Browser.fbuf_table == "undefined") {
-          Browser.fbuf_table = new Object();
-          Browser.fbuf_next_handle = 1;
+      if (typeof WgetState.fbuf_table == "undefined") {
+          WgetState.fbuf_table = new Object();
+          WgetState.fbuf_next_handle = 1;
       }
       for(;;) {
-          h = Browser.fbuf_next_handle;
-          Browser.fbuf_next_handle++;
-          if (Browser.fbuf_next_handle == 0x80000000)
-              Browser.fbuf_next_handle = 1;
-          if (typeof Browser.fbuf_table[h] == "undefined") {
+          h = WgetState.fbuf_next_handle;
+          WgetState.fbuf_next_handle++;
+          if (WgetState.fbuf_next_handle == 0x80000000)
+              WgetState.fbuf_next_handle = 1;
+          if (typeof WgetState.fbuf_table[h] == "undefined") {
 //              console.log("new handle=" + h);
               return h;
           }
@@ -212,15 +219,15 @@ mergeInto(LibraryManager.library, {
       size = HEAPU32[(bs + 4) >> 2];
       if (new_size == 0) {
           if (h != 0) {
-              delete Browser.fbuf_table[h];
+              delete WgetState.fbuf_table[h];
               h = 0;
           }
       } else if (size == 0) {
           h = _file_buffer_get_new_handle();
           new_data = new Uint8Array(new_size);
-          Browser.fbuf_table[h] = new_data;
+          WgetState.fbuf_table[h] = new_data;
       } else if (size != new_size) {
-          data = Browser.fbuf_table[h];
+          data = WgetState.fbuf_table[h];
           new_data = new Uint8Array(new_size);
           if (new_size > size) {
               new_data.set(data, 0);
@@ -228,7 +235,7 @@ mergeInto(LibraryManager.library, {
               for(i = 0; i < new_size; i = (i + 1) | 0)
                   new_data[i] = data[i];
           }
-          Browser.fbuf_table[h] = new_data;
+          WgetState.fbuf_table[h] = new_data;
       }
       HEAPU32[bs >> 2] = h;
       HEAPU32[(bs + 4) >> 2] = new_size;
@@ -246,7 +253,7 @@ mergeInto(LibraryManager.library, {
       var h, data, i;
       h = HEAPU32[bs >> 2];
       if (h) {
-          data = Browser.fbuf_table[h];
+          data = WgetState.fbuf_table[h];
           for(i = 0; i < size; i = (i + 1) | 0) {
               data[offset + i] = HEAPU8[buf + i];
           }
@@ -258,7 +265,7 @@ mergeInto(LibraryManager.library, {
       var h, data, i;
       h = HEAPU32[bs >> 2];
       if (h) {
-          data = Browser.fbuf_table[h];
+          data = WgetState.fbuf_table[h];
           for(i = 0; i < size; i = (i + 1) | 0) {
               HEAPU8[buf + i] = data[offset + i];
           }
@@ -270,7 +277,7 @@ mergeInto(LibraryManager.library, {
       var h, data, i;
       h = HEAPU32[bs >> 2];
       if (h) {
-          data = Browser.fbuf_table[h];
+          data = WgetState.fbuf_table[h];
           for(i = 0; i < size; i = (i + 1) | 0) {
               data[offset + i] = val;
           }

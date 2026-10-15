@@ -1,0 +1,1 @@
+void beep(int freq) {}

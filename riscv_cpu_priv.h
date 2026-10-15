@@ -39,7 +39,7 @@
 
 #define CONFIG_EXT_C /* compressed instructions */
 
-#if defined(EMSCRIPTEN)
+#if defined(__EMSCRIPTEN__)
 #define USE_GLOBAL_STATE
 /* use local variables slows down the generated JS code */
 #define USE_GLOBAL_VARIABLES

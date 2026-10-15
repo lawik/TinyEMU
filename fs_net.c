@@ -37,7 +37,7 @@
 #include "fs_wget.h"
 #include "fbuf.h"
 
-#if defined(EMSCRIPTEN)
+#if defined(__EMSCRIPTEN__)
 #include <emscripten.h>
 #endif
 
@@ -50,11 +50,11 @@
 */
 
 //#define DEBUG_CACHE
-#if !defined(EMSCRIPTEN)
+#if !defined(__EMSCRIPTEN__)
 #define DUMP_CACHE_LOAD
 #endif
 
-#if defined(EMSCRIPTEN)
+#if defined(__EMSCRIPTEN__)
 #define DEFAULT_INODE_CACHE_SIZE (64 * 1024 * 1024)
 #else
 #define DEFAULT_INODE_CACHE_SIZE (256 * 1024 * 1024)
@@ -266,7 +266,7 @@ static void fs_error_archive(FSOpenInfo *oi);
 static void dump_loaded_file(FSDevice *fs1, FSINode *n);
 #endif
 
-#if !defined(EMSCRIPTEN)
+#if !defined(__EMSCRIPTEN__)
 /* file buffer (the content of the buffer can be stored elsewhere) */
 void file_buffer_init(FileBuffer *bs)
 {
@@ -2089,7 +2089,7 @@ static void kernel_load_cb(FSDevice *fs, FSQID *qid, int err,
                            void *opaque);
 static int preload_parse(FSDevice *fs, const char *fname, BOOL is_new);
 
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
 static FSDevice *fs_import_fs;
 #endif
 
@@ -2104,7 +2104,7 @@ FSDevice *fs_net_init(const char *url, void (*start_cb)(void *opaque),
     fs_wget_init();
     
     fs = fs_mem_init();
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
     if (!fs_import_fs)
         fs_import_fs = fs;
 #endif
@@ -2866,7 +2866,7 @@ void fs_net_set_pwd(FSDevice *fs, const char *pwd)
 
 /* external file import */
 
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
 
 void fs_import_file(const char *filename, uint8_t *buf, int buf_len)
 {

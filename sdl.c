@@ -241,7 +241,7 @@ static void sdl_hide_cursor(void)
 
 static int beepfreq;
 
-#ifndef EMSCRIPTEN
+#ifndef __EMSCRIPTEN__
 void beep(int freq)
 {
 	SDL_LockAudio();
@@ -305,7 +305,7 @@ void sdl_init(int width, int height)
 
     sdl_hide_cursor();
 
-#ifndef EMSCRIPTEN
+#ifndef __EMSCRIPTEN__
     sdl_sound_init(SAMPLERATE);
 #endif
 }

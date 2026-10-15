@@ -31,7 +31,7 @@
 
 #define VIRTIO_PAGE_SIZE 4096
 
-#if defined(EMSCRIPTEN)
+#if defined(__EMSCRIPTEN__)
 #define VIRTIO_ADDR_BITS 32
 #else
 #define VIRTIO_ADDR_BITS 64
@@ -87,7 +87,7 @@ struct EthernetDevice {
     void (*write_packet)(EthernetDevice *net,
                          const uint8_t *buf, int len);
     void *opaque;
-#if !defined(EMSCRIPTEN)
+#if !defined(__EMSCRIPTEN__)
     void (*select_fill)(EthernetDevice *net, int *pfd_max,
                         fd_set *rfds, fd_set *wfds, fd_set *efds,
                         int *pdelay);

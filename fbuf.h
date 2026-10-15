@@ -2,7 +2,7 @@
 #define FBUF_H
 
 typedef struct {
-#if defined(EMSCRIPTEN)
+#if defined(__EMSCRIPTEN__)
     int handle;
 #else
     uint8_t *data;

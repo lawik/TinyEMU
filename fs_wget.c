@@ -36,7 +36,7 @@
 #include "fs_utils.h"
 #include "fs_wget.h"
 
-#if defined(EMSCRIPTEN)
+#if defined(__EMSCRIPTEN__)
 #include <emscripten.h>
 #else
 #include <curl/multi.h>
@@ -45,7 +45,7 @@
 /***********************************************/
 /* HTTP get */
 
-#ifdef EMSCRIPTEN
+#ifdef __EMSCRIPTEN__
 
 struct XHRState {
     void *opaque;

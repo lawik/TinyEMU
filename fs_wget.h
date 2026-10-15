@@ -21,7 +21,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
-#if defined(EMSCRIPTEN)
+#if defined(__EMSCRIPTEN__)
 #define USE_BUILTIN_CRYPTO
 #endif
 
@@ -56,7 +56,7 @@ void fs_wget_free(XHRState *s);
 void fs_wget_init(void);
 void fs_wget_end(void);
 
-#ifndef EMSCRIPTEN
+#ifndef __EMSCRIPTEN__
 typedef BOOL FSNetEventLoopCompletionFunc(void *opaque);
 void fs_net_set_fdset(int *pfd_max, fd_set *rfds, fd_set *wfds, fd_set *efds,
                       int *ptimeout);
