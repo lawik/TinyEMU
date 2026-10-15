@@ -114,9 +114,20 @@ typedef struct VirtMachine {
     /* console */
     VIRTIODevice *console_dev;
     CharacterDevice *console;
+    /* optional: offered each input byte before the virtio console; returns
+       TRUE if it consumed it (used for HTIF keyboard input) */
+    BOOL (*console_input_filter)(struct VirtMachine *m, uint8_t c);
+    /* optional: TRUE while the filter wants input even though the virtio
+       console is not ready (e.g. firmware waiting for a key) */
+    BOOL (*console_input_wanted)(struct VirtMachine *m);
     /* graphics */
     FBDevice *fb_dev;
 } VirtMachine;
+
+/* console input helpers for the frontends */
+BOOL virt_machine_console_input_ready(VirtMachine *m);
+int virt_machine_console_input_len(VirtMachine *m);
+void virt_machine_console_input(VirtMachine *m, const uint8_t *buf, int len);
 
 struct VirtMachineClass {
     const char *machine_names;

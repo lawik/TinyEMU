@@ -55,6 +55,7 @@ typedef struct RISCVMachine {
     IRQSignal plic_irq[32]; /* IRQ 0 is not used */
     /* HTIF */
     uint64_t htif_tohost, htif_fromhost;
+    BOOL htif_kbd_wanted; /* guest asked for a keyboard character */
 
     VIRTIODevice *keyboard_dev;
     VIRTIODevice *mouse_dev;
@@ -148,8 +149,10 @@ static void htif_handle_cmd(RISCVMachine *s)
         s->htif_tohost = 0;
         s->htif_fromhost = ((uint64_t)device << 56) | ((uint64_t)cmd << 48);
     } else if (device == 1 && cmd == 0) {
-        /* request keyboard interrupt */
+        /* request keyboard interrupt: the next console input byte goes
+           to HTIF instead of the virtio console */
         s->htif_tohost = 0;
+        s->htif_kbd_wanted = TRUE;
     } else {
         printf("HTIF: unsupported tohost=0x%016" PRIx64 "\n", s->htif_tohost);
     }
@@ -179,6 +182,31 @@ static void htif_write(void *opaque, uint32_t offset, uint32_t val,
     default:
         break;
     }
+}
+
+/* console input goes to HTIF only while the guest (e.g. U-Boot) has an
+   outstanding getc request, so that Linux's virtio console is not robbed
+   of keystrokes */
+static BOOL htif_console_input_wanted(VirtMachine *m)
+{
+    RISCVMachine *s = (RISCVMachine *)m;
+
+    /* once the guest runs a virtio console (Linux), all input goes there */
+    if (m->console_dev && virtio_console_can_write_data(m->console_dev))
+        return FALSE;
+    return s->htif_kbd_wanted && s->htif_fromhost == 0;
+}
+
+static BOOL htif_console_input(VirtMachine *m, uint8_t c)
+{
+    if (!htif_console_input_wanted(m))
+        return FALSE;
+    {
+        RISCVMachine *s = (RISCVMachine *)m;
+        s->htif_fromhost = ((uint64_t)1 << 56) | ((uint64_t)0 << 48) | c;
+        s->htif_kbd_wanted = FALSE;
+    }
+    return TRUE;
 }
 
 #if 0
@@ -691,6 +719,9 @@ static int riscv_build_fdt(RISCVMachine *m, uint8_t *dst,
     tab[6] = 0;
     tab[7] = 8;
     fdt_prop_tab_u32(s, "reg", tab, 8);
+    /* U-Boot only binds pre-relocation console drivers to nodes tagged
+       this way (see doc/develop/devicetree/dt_qemu.rst in U-Boot) */
+    fdt_prop(s, "bootph-all", NULL, 0);
     fdt_end_node(s); /* htif */
 
     fdt_begin_node(s, "soc");
@@ -888,6 +919,8 @@ static VirtMachine *riscv_machine_init(const VirtMachineParams *p)
     s->mem_map->opaque = s;
     s->mem_map->flush_tlb_write_range = riscv_flush_tlb_write_range;
 
+    s->common.console_input_filter = htif_console_input;
+    s->common.console_input_wanted = htif_console_input_wanted;
     s->cpu_state = riscv_cpu_init(s->mem_map, max_xlen);
     /* expose the CLINT's mtime through the 'time' CSR as well, so that
        firmware (OpenSBI) and S-mode software can rdtime without traps */

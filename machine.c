@@ -638,3 +638,40 @@ void virt_machine_end(VirtMachine *s)
 {
     s->vmc->virt_machine_end(s);
 }
+
+BOOL virt_machine_console_input_ready(VirtMachine *m)
+{
+    if (m->console_input_wanted && m->console_input_wanted(m))
+        return TRUE;
+    return m->console_dev && virtio_console_can_write_data(m->console_dev);
+}
+
+/* how many bytes the frontend may read from the host console now */
+int virt_machine_console_input_len(VirtMachine *m)
+{
+    int len = 0;
+    if (m->console_dev)
+        len = virtio_console_get_write_len(m->console_dev);
+    if (m->console_input_wanted && m->console_input_wanted(m) && len < 1)
+        len = 1;
+    return len;
+}
+
+void virt_machine_console_input(VirtMachine *m, const uint8_t *buf, int len)
+{
+    uint8_t tmp[256];
+    int i, n;
+
+    while (len > 0) {
+        n = 0;
+        for(i = 0; i < len && n < (int)sizeof(tmp); i++) {
+            if (m->console_input_filter && m->console_input_filter(m, buf[i]))
+                continue;
+            tmp[n++] = buf[i];
+        }
+        if (n > 0 && m->console_dev)
+            virtio_console_write_data(m->console_dev, tmp, n);
+        buf += i;
+        len -= i;
+    }
+}

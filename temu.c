@@ -551,7 +551,7 @@ void virt_machine_run(VirtMachine *m)
     FD_ZERO(&efds);
     fd_max = -1;
 #ifndef _WIN32
-    if (m->console_dev && virtio_console_can_write_data(m->console_dev)) {
+    if (virt_machine_console_input_ready(m)) {
         STDIODevice *s = m->console->opaque;
         stdin_fd = s->stdin_fd;
         FD_SET(stdin_fd, &rfds);
@@ -579,14 +579,14 @@ void virt_machine_run(VirtMachine *m)
     }
     if (ret > 0) {
 #ifndef _WIN32
-        if (m->console_dev && FD_ISSET(stdin_fd, &rfds)) {
+        if (virt_machine_console_input_ready(m) && FD_ISSET(stdin_fd, &rfds)) {
             uint8_t buf[128];
             int ret, len;
-            len = virtio_console_get_write_len(m->console_dev);
+            len = virt_machine_console_input_len(m);
             len = min_int(len, sizeof(buf));
             ret = m->console->read_data(m->console->opaque, buf, len);
             if (ret > 0) {
-                virtio_console_write_data(m->console_dev, buf, ret);
+                virt_machine_console_input(m, buf, ret);
             }
         }
 #endif

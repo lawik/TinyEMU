@@ -358,6 +358,14 @@ static void bf_read_onload(void *opaque, int err, void *data, size_t size)
     CachedBlock *b = opaque;
     BlockDeviceHTTP *bf = b->bf;
 
+    if (err == -404) {
+        /* a block that is not served is all zeros: this lets the server
+           skip the empty parts of a disk image */
+        void *zeros = mallocz(bf->block_size * 512);
+        bf_update_block(b, zeros);
+        free(zeros);
+        return;
+    }
     if (err < 0) {
         fprintf(stderr, "Could not load block %u\n", b->block_num);
         exit(1);

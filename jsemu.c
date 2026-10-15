@@ -308,14 +308,14 @@ void virt_machine_run(void *opaque)
     int delay, i;
     FBDevice *fb_dev;
     
-    if (m->console_dev && virtio_console_can_write_data(m->console_dev)) {
+    if (virt_machine_console_input_ready(m)) {
         uint8_t buf[128];
         int ret, len;
-        len = virtio_console_get_write_len(m->console_dev);
+        len = virt_machine_console_input_len(m);
         len = min_int(len, sizeof(buf));
         ret = m->console->read_data(m->console->opaque, buf, len);
         if (ret > 0)
-            virtio_console_write_data(m->console_dev, buf, ret);
+            virt_machine_console_input(m, buf, ret);
         if (console_resize_pending) {
             int w, h;
             console_get_size(&w, &h);
