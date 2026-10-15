@@ -91,7 +91,9 @@ mergeInto(LibraryManager.library, {
 
     // LOAD
     http.onload = function http_onload(e) {
-      if (http.status == 200 || _url.substr(0,4).toLowerCase() != "http") {
+      /* status 0 with a non-http page means a file:// load; anything
+         else that is not 200 (e.g. 404) is an error */
+      if (http.status == 200 || (http.status == 0 && location.protocol != "http:" && location.protocol != "https:")) {
         var byteArray = new Uint8Array(http.response);
         var buffer = _malloc(byteArray.length);
         HEAPU8.set(byteArray, buffer);
