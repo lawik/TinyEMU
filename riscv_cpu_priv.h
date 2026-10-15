@@ -218,6 +218,10 @@ struct RISCVCPUState {
     uint32_t medeleg;
     uint32_t mideleg;
     uint32_t mcounteren;
+    /* Physical Memory Protection: registers are stored so that M-mode
+       firmware (OpenSBI) can configure them, but nothing is enforced */
+    uint8_t pmpcfg[64];
+    target_ulong pmpaddr[64];
     
     target_ulong stvec;
     target_ulong sscratch;

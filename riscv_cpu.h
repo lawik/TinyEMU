@@ -59,6 +59,9 @@ typedef struct {
 
 typedef struct {
     const RISCVCPUClass *class_ptr;
+    /* machine-provided value for the 'time' CSR (NULL: CSR not present) */
+    uint64_t (*get_time)(void *opaque);
+    void *get_time_opaque;
 } RISCVCPUCommonState;
 
 int riscv_cpu_get_max_xlen(void);

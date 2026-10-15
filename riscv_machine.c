@@ -99,6 +99,11 @@ static uint64_t rtc_get_time(RISCVMachine *m)
     return val;
 }
 
+static uint64_t riscv_machine_get_time(void *opaque)
+{
+    return rtc_get_time(opaque);
+}
+
 static uint32_t htif_read(void *opaque, uint32_t offset,
                           int size_log2)
 {
@@ -593,7 +598,7 @@ static int riscv_build_fdt(RISCVMachine *m, uint8_t *dst,
     int size, max_xlen, i, cur_phandle, intc_phandle, plic_phandle;
     char isa_string[128], *q;
     uint32_t misa;
-    uint32_t tab[4];
+    uint32_t tab[8];
     FBDevice *fb_dev;
     
     s = fdt_init();
@@ -675,6 +680,17 @@ static int riscv_build_fdt(RISCVMachine *m, uint8_t *dst,
 
     fdt_begin_node(s, "htif");
     fdt_prop_str(s, "compatible", "ucb,htif0");
+    /* fromhost then tohost, as OpenSBI's fdt_serial_htif expects; the
+       registers are MMIO at HTIF_BASE_ADDR (tohost @0, fromhost @8) */
+    tab[0] = 0;
+    tab[1] = HTIF_BASE_ADDR + 8;
+    tab[2] = 0;
+    tab[3] = 8;
+    tab[4] = 0;
+    tab[5] = HTIF_BASE_ADDR;
+    tab[6] = 0;
+    tab[7] = 8;
+    fdt_prop_tab_u32(s, "reg", tab, 8);
     fdt_end_node(s); /* htif */
 
     fdt_begin_node(s, "soc");
@@ -873,6 +889,10 @@ static VirtMachine *riscv_machine_init(const VirtMachineParams *p)
     s->mem_map->flush_tlb_write_range = riscv_flush_tlb_write_range;
 
     s->cpu_state = riscv_cpu_init(s->mem_map, max_xlen);
+    /* expose the CLINT's mtime through the 'time' CSR as well, so that
+       firmware (OpenSBI) and S-mode software can rdtime without traps */
+    ((RISCVCPUCommonState *)s->cpu_state)->get_time = riscv_machine_get_time;
+    ((RISCVCPUCommonState *)s->cpu_state)->get_time_opaque = s;
     if (!s->cpu_state) {
         vm_error("unsupported max_xlen=%d\n", max_xlen);
         /* XXX: should free resources */

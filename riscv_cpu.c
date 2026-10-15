@@ -745,6 +745,30 @@ static int csr_read(RISCVCPUState *s, target_ulong *pval, uint32_t csr,
         }
         val = (int64_t)s->insn_counter;
         break;
+    case 0xc01: /* time */
+    case 0xc81: /* timeh */
+        if (!s->common.get_time)
+            goto invalid_csr;
+        if (csr == 0xc81 && s->cur_xlen != 32)
+            goto invalid_csr;
+        {
+            uint32_t counteren;
+            if (s->priv < PRV_M) {
+                if (s->priv < PRV_S)
+                    counteren = s->scounteren;
+                else
+                    counteren = s->mcounteren;
+                if (((counteren >> (csr & 0x1f)) & 1) == 0)
+                    goto invalid_csr;
+            }
+        }
+        {
+            uint64_t t = s->common.get_time(s->common.get_time_opaque);
+            if (csr == 0xc81)
+                t >>= 32;
+            val = t;
+        }
+        break;
     case 0xc80: /* mcycleh */
     case 0xc82: /* minstreth */
         if (s->cur_xlen != 32)
@@ -815,6 +839,26 @@ static int csr_read(RISCVCPUState *s, target_ulong *pval, uint32_t csr,
     case 0x306:
         val = s->mcounteren;
         break;
+    case 0x3a0 ... 0x3af: /* pmpcfg0..15 */
+        {
+            int i, n, base;
+            if (s->cur_xlen == 32) {
+                n = 4;
+                base = (csr - 0x3a0) * 4;
+            } else {
+                if (csr & 1)
+                    goto invalid_csr;
+                n = 8;
+                base = (csr - 0x3a0) * 4;
+            }
+            val = 0;
+            for(i = 0; i < n; i++)
+                val |= (target_ulong)s->pmpcfg[base + i] << (8 * i);
+        }
+        break;
+    case 0x3b0 ... 0x3ef: /* pmpaddr0..63 */
+        val = s->pmpaddr[csr - 0x3b0];
+        break;
     case 0x340:
         val = s->mscratch;
         break;
@@ -839,6 +883,13 @@ static int csr_read(RISCVCPUState *s, target_ulong *pval, uint32_t csr,
         if (s->cur_xlen != 32)
             goto invalid_csr;
         val = s->insn_counter >> 32;
+        break;
+    case 0xf11: /* mvendorid */
+    case 0xf12: /* marchid */
+    case 0xf13: /* mimpid */
+    case 0xf15: /* mconfigptr */
+        /* mandatory read-only CSRs; 0 means "not implemented" */
+        val = 0;
         break;
     case 0xf14:
         val = s->mhartid;
@@ -994,6 +1045,27 @@ static int csr_write(RISCVCPUState *s, uint32_t csr, target_ulong val)
         break;
     case 0x306:
         s->mcounteren = val & COUNTEREN_MASK;
+        break;
+    case 0x3a0 ... 0x3af: /* pmpcfg0..15 */
+        {
+            int i, n, base;
+            if (s->cur_xlen == 32) {
+                n = 4;
+                base = (csr - 0x3a0) * 4;
+            } else {
+                if (csr & 1)
+                    return -1;
+                n = 8;
+                base = (csr - 0x3a0) * 4;
+            }
+            for(i = 0; i < n; i++)
+                s->pmpcfg[base + i] = (val >> (8 * i)) & 0x9f; /* L,A,X,W,R */
+        }
+        break;
+    case 0x3b0 ... 0x3ef: /* pmpaddr0..63 */
+        /* address field is (physical address >> 2); 56-bit physical
+           addresses are the most any of Sv39/48/57 can produce */
+        s->pmpaddr[csr - 0x3b0] = (target_ulong)((uint64_t)val & 0x3fffffffffffffull);
         break;
     case 0x340:
         s->mscratch = val;
