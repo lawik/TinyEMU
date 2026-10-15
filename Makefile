@@ -89,6 +89,8 @@ CFLAGS+=-DCONFIG_SDL
 ifdef CONFIG_WIN32
 LDFLAGS+=-mwindows
 endif
+else
+EMU_OBJS+=beep_stub.o
 endif
 
 EMU_OBJS+=riscv_machine.o softfp.o riscv_cpu32.o riscv_cpu64.o

@@ -644,8 +644,10 @@ static void glue(riscv_cpu_flush_tlb_write_range_ram,
                       MSTATUS_FS | \
                       MSTATUS_MPRV | MSTATUS_SUM | MSTATUS_MXR)
 
-/* cycle and insn counters */
-#define COUNTEREN_MASK ((1 << 0) | (1 << 2))
+/* cycle, time and insn counters. The time bit must be writable: TinyEMU does
+   not implement the time CSR, the M-mode firmware (BBL) emulates rdtime on
+   trap and checks scounteren.TM for U-mode. Linux 6.x enables TM at boot. */
+#define COUNTEREN_MASK ((1 << 0) | (1 << 1) | (1 << 2))
 
 /* return the complete mstatus with the SD bit */
 static target_ulong get_mstatus(RISCVCPUState *s, target_ulong mask)
@@ -1044,6 +1046,8 @@ static void raise_exception2(RISCVCPUState *s, uint32_t cause,
 {
     BOOL deleg;
     target_ulong causel;
+
+    }
     
 #if defined(DUMP_EXCEPTIONS) || defined(DUMP_MMU_EXCEPTIONS) || defined(DUMP_INTERRUPTS)
     {

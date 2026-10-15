@@ -655,6 +655,24 @@ static int riscv_build_fdt(RISCVMachine *m, uint8_t *dst,
     
     fdt_end_node(s); /* memory */
 
+    /* Reserve the firmware region below the kernel. BBL stays resident at
+       RAM_BASE_ADDR and handles every SBI call and rdtime emulation, but
+       nothing told Linux about it; Linux 6.x allocates RAM below the kernel
+       image, overwrites BBL and then dies in an M-mode trap loop as soon
+       as userspace gets busy. OpenSBI publishes the same kind of node. */
+    if (kernel_size > 0 && kernel_start > RAM_BASE_ADDR) {
+        fdt_begin_node(s, "reserved-memory");
+        fdt_prop_u32(s, "#address-cells", 2);
+        fdt_prop_u32(s, "#size-cells", 2);
+        fdt_prop(s, "ranges", NULL, 0);
+        fdt_begin_node_num(s, "mmode_resv0", RAM_BASE_ADDR);
+        fdt_prop_tab_u64_2(s, "reg", RAM_BASE_ADDR,
+                           kernel_start - RAM_BASE_ADDR);
+        fdt_prop(s, "no-map", NULL, 0);
+        fdt_end_node(s); /* mmode_resv0 */
+        fdt_end_node(s); /* reserved-memory */
+    }
+
     fdt_begin_node(s, "htif");
     fdt_prop_str(s, "compatible", "ucb,htif0");
     fdt_end_node(s); /* htif */
