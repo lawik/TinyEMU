@@ -73,6 +73,7 @@ typedef struct BlockDeviceHTTP {
     BlockDevice *bs;
     int max_cache_size_kb;
     char url[1024];
+    char disk_id[1100];
     int prefetch_count;
     void (*start_cb)(void *opaque);
     void *start_opaque;
@@ -109,6 +110,14 @@ typedef struct BlockDeviceHTTP {
 } BlockDeviceHTTP;
 
 static void bf_update_block(CachedBlock *b, const uint8_t *data);
+static void bf_init_done(BlockDeviceHTTP *bf);
+#ifdef __EMSCRIPTEN__
+/* provided in lib.js: keep written clusters in the browser (IndexedDB) so
+   that they survive a page reload */
+extern void block_persist_open(BlockDeviceHTTP *bf, const char *disk_id,
+                               int cluster_bytes);
+extern void block_persist_dirty(int cluster_num, int fbuf_handle);
+#endif
 static void bf_read_onload(void *opaque, int err, void *data, size_t size);
 static void bf_init_onload(void *opaque, int err, void *data, size_t size);
 static void bf_prefetch_group_onload(void *opaque, int err, void *data,
@@ -277,6 +286,9 @@ static int bf_rw_async1(BlockDevice *bs, BOOL is_sync)
             if (bf->is_write) {
                 file_buffer_write(&c->fbuf, offset * 512,
                                   bf->io_buf + bf->sector_index * 512, n * 512);
+#ifdef __EMSCRIPTEN__
+                block_persist_dirty(cluster_num, c->fbuf.handle);
+#endif
             } else {
                 file_buffer_read(&c->fbuf, offset * 512,
                                  bf->io_buf + bf->sector_index * 512, n * 512);
@@ -530,9 +542,57 @@ static void bf_init_onload(void *opaque, int err, void *data, size_t size)
             idx += l;
         }
     }
+    {
+        /* optional identity of the disk image: persisted writes are
+           keyed by it so a new image does not inherit stale data */
+        JSONValue id = json_object_get(cfg, "id");
+        if (id.type == JSON_STR) {
+            pstrcpy(bf->disk_id, sizeof(bf->disk_id), id.u.str->data);
+        } else {
+            snprintf(bf->disk_id, sizeof(bf->disk_id), "%sblk.txt", bf->url);
+        }
+    }
     json_free(cfg);
-    
+
+#ifdef __EMSCRIPTEN__
+    /* restore the clusters written in earlier sessions, then start */
+    block_persist_open(bf, bf->disk_id, bf->sectors_per_cluster * 512);
+#else
+    bf_init_done(bf);
+#endif
+}
+
+static void bf_init_done(BlockDeviceHTTP *bf)
+{
     if (bf->start_cb) {
         bf->start_cb(bf->start_opaque);
     }
+}
+
+/* called from JS while restoring persisted clusters */
+void block_persist_set_cluster(BlockDeviceHTTP *bf, int cluster_num,
+                               const uint8_t *data)
+{
+    Cluster *c;
+    int cluster_size;
+
+    if (cluster_num < 0 || cluster_num >= bf->n_clusters)
+        return;
+    cluster_size = bf->sectors_per_cluster * 512;
+    c = bf->clusters[cluster_num];
+    if (!c) {
+        c = mallocz(sizeof(Cluster));
+        file_buffer_init(&c->fbuf);
+        file_buffer_resize(&c->fbuf, cluster_size);
+        bf->clusters[cluster_num] = c;
+        bf->n_allocated_clusters++;
+    }
+    file_buffer_write(&c->fbuf, 0, data, cluster_size);
+}
+
+/* called from JS once the persisted clusters are restored (or when
+   persistence is unavailable) */
+void block_persist_ready(BlockDeviceHTTP *bf)
+{
+    bf_init_done(bf);
 }

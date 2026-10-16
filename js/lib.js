@@ -145,6 +145,187 @@ mergeInto(LibraryManager.library, {
     return handle;
   },
 
+  /* Disk persistence: clusters written by the guest are saved in
+     IndexedDB and restored before the VM starts. One database holds the
+     clusters of a single disk image, keyed by [disk id, cluster number];
+     clusters of other disk ids are discarded on open. The page may define
+     update_disk_persist(info) to show the state. */
+  $DiskPersist: {
+      db: null,
+      id: null,
+      cluster_bytes: 0,
+      dirty: {},
+      saved: {},
+      timer: null,
+      n_saved: 0,
+      n_restored: 0,
+      status: "off",
+  },
+
+  $disk_persist_notify__deps: ['$DiskPersist'],
+  $disk_persist_notify: function()
+  {
+      var P = DiskPersist;
+      if (typeof update_disk_persist == "function") {
+          update_disk_persist({ status: P.status,
+                                saved_bytes: P.n_saved * P.cluster_bytes,
+                                restored_bytes: P.n_restored * P.cluster_bytes });
+      }
+  },
+
+  $disk_persist_flush__deps: ['$DiskPersist', '$WgetState', '$disk_persist_notify'],
+  $disk_persist_flush: function()
+  {
+      var P = DiskPersist, dirty, k, data, tx, store, n;
+      if (P.timer !== null) {
+          clearTimeout(P.timer);
+          P.timer = null;
+      }
+      if (!P.db)
+          return;
+      dirty = P.dirty;
+      P.dirty = {};
+      n = 0;
+      try {
+          tx = P.db.transaction("clusters", "readwrite");
+          store = tx.objectStore("clusters");
+          for (k in dirty) {
+              data = WgetState.fbuf_table[dirty[k]];
+              if (data) {
+                  store.put(data.slice(0), [P.id, k | 0]);
+                  n++;
+              }
+          }
+          tx.oncomplete = function() {
+              disk_persist_notify();
+          };
+          tx.onerror = function() {
+              console.log("disk persistence: write failed: " + tx.error);
+              P.status = "error";
+              disk_persist_notify();
+          };
+      } catch (e) {
+          console.log("disk persistence: " + e);
+          P.status = "error";
+          disk_persist_notify();
+      }
+  },
+
+  block_persist_dirty__deps: ['$DiskPersist', '$disk_persist_flush'],
+  block_persist_dirty: function(cluster_num, fbuf_handle)
+  {
+      var P = DiskPersist;
+      if (!P.db)
+          return;
+      P.dirty[cluster_num] = fbuf_handle;
+      if (!(cluster_num in P.saved)) {
+          P.saved[cluster_num] = 1;
+          P.n_saved++;
+      }
+      if (P.timer === null) {
+          P.timer = setTimeout(disk_persist_flush, 300);
+          disk_persist_notify();
+      }
+  },
+
+  block_persist_open__deps: ['$DiskPersist', '$disk_persist_flush', '$disk_persist_notify'],
+  block_persist_open: function(bf, disk_id, cluster_bytes)
+  {
+      var P = DiskPersist, id, req, done, finished = false;
+
+      id = UTF8ToString(disk_id);
+      P.cluster_bytes = cluster_bytes;
+      done = function(status) {
+          if (finished)
+              return;
+          finished = true;
+          P.status = status;
+          disk_persist_notify();
+          _block_persist_ready(bf);
+      };
+      if (typeof indexedDB == "undefined") {
+          done("off");
+          return;
+      }
+      try {
+          req = indexedDB.open("tinyemu-disk", 1);
+      } catch (e) {
+          done("off");
+          return;
+      }
+      req.onupgradeneeded = function() {
+          var db = req.result;
+          if (!db.objectStoreNames.contains("clusters"))
+              db.createObjectStore("clusters");
+      };
+      req.onerror = function() {
+          console.log("disk persistence unavailable: " + req.error);
+          done("off");
+      };
+      req.onblocked = function() {
+          console.log("disk persistence: database blocked");
+          done("off");
+      };
+      req.onsuccess = function() {
+          var db = req.result, tx, store, cur, buf, n = 0;
+          try {
+              tx = db.transaction("clusters", "readwrite");
+          } catch (e) {
+              done("off");
+              return;
+          }
+          store = tx.objectStore("clusters");
+          buf = _malloc(cluster_bytes);
+          cur = store.openCursor();
+          cur.onsuccess = function() {
+              var c = cur.result, key;
+              if (!c)
+                  return;
+              key = c.key;
+              if (!(key instanceof Array) || key[0] !== id ||
+                  !(c.value instanceof Uint8Array) ||
+                  c.value.length != cluster_bytes) {
+                  /* another disk image, or garbage */
+                  c.delete();
+              } else {
+                  HEAPU8.set(c.value, buf);
+                  _block_persist_set_cluster(bf, key[1], buf);
+                  P.saved[key[1]] = 1;
+                  n++;
+              }
+              c.continue();
+          };
+          tx.oncomplete = function() {
+              _free(buf);
+              P.db = db;
+              P.id = id;
+              P.n_restored = n;
+              P.n_saved = n;
+              db.onversionchange = function() {
+                  /* another tab wants to delete the database */
+                  disk_persist_flush();
+                  db.close();
+                  P.db = null;
+                  P.status = "off";
+                  disk_persist_notify();
+              };
+              /* do not lose the last second of writes when the tab goes away */
+              document.addEventListener("visibilitychange", function() {
+                  if (document.visibilityState == "hidden")
+                      disk_persist_flush();
+              });
+              window.addEventListener("pagehide", disk_persist_flush);
+              console.log("disk persistence: restored " + n + " clusters for " + id);
+              done("on");
+          };
+          tx.onerror = function() {
+              _free(buf);
+              console.log("disk persistence: restore failed: " + tx.error);
+              done("off");
+          };
+      };
+  },
+
   fs_wget_update_downloading: function (flag)
   {
       update_downloading(Boolean(flag));
