@@ -193,7 +193,6 @@ static void bf_start_load_block(BlockDevice *bs, int block_num)
            (int)(bf->n_allocated_clusters * bf->sectors_per_cluster / 2));
 #endif
     snprintf(filename, sizeof(filename), BLK_FMT, bf->url, block_num);
-    //    printf("wget %s\n", filename);
     fs_wget(filename, NULL, NULL, b, bf_read_onload, TRUE);
 }
 

@@ -1047,10 +1047,19 @@ static void virtio_block_req_end(VIRTIODevice *s, int ret)
         else
             buf1[0] = VIRTIO_BLK_S_OK;
         memcpy_to_queue(s, queue_idx, desc_idx, 0, buf1, sizeof(buf1));
+        /* the data buffer lives until the (possibly asynchronous) write
+           has completed */
+        free(s1->req.buf);
+        s1->req.buf = NULL;
         virtio_consume_desc(s, queue_idx, desc_idx, 1);
         break;
     default:
-        abort();
+        /* unsupported request (flush, discard, get-id, ...): tell the
+           guest instead of leaving the request pending forever */
+        buf1[0] = VIRTIO_BLK_S_UNSUPP;
+        memcpy_to_queue(s, queue_idx, desc_idx, 0, buf1, sizeof(buf1));
+        virtio_consume_desc(s, queue_idx, desc_idx, 1);
+        break;
     }
 }
 
@@ -1105,9 +1114,9 @@ static int virtio_block_recv_request(VIRTIODevice *s, int queue_idx,
         len = read_size - sizeof(h);
         buf = malloc(len);
         memcpy_from_queue(s, buf, queue_idx, desc_idx, sizeof(h), len);
+        s1->req.buf = buf;
         ret = bs->write_async(bs, h.sector_num, buf, len / SECTOR_SIZE,
                               virtio_block_req_cb, s);
-        free(buf);
         if (ret > 0) {
             /* asyncronous write */
             s1->req_in_progress = TRUE;
@@ -1116,6 +1125,8 @@ static int virtio_block_recv_request(VIRTIODevice *s, int queue_idx,
         }
         break;
     default:
+        if (write_size >= 1)
+            virtio_block_req_end(s, -1);
         break;
     }
     return 0;
