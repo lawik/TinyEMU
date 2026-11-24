@@ -1136,6 +1136,13 @@ static VirtMachine *riscv_machine_init(const VirtMachineParams *p)
         }
     }
     
+    /* entropy source, after the other devices so that their addresses
+       and interrupts do not move */
+    vbus->irq = &s->plic_irq[irq_num];
+    s->virtio_devs[s->virtio_count++] = virtio_rng_init(vbus);
+    vbus->addr += VIRTIO_SIZE;
+    irq_num++;
+
     if (!p->files[VM_FILE_BIOS].buf) {
         vm_error("No bios found");
     }

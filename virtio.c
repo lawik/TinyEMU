@@ -27,6 +27,7 @@
 #include <inttypes.h>
 #include <assert.h>
 #include <stdarg.h>
+#include <sys/random.h>
 
 #include "cutils.h"
 #include "list.h"
@@ -1389,6 +1390,41 @@ VIRTIODevice *virtio_console_init(VIRTIOBusDef *bus, CharacterDevice *cs)
     
     s->cs = cs;
     return (VIRTIODevice *)s;
+}
+
+/*********************************************************************/
+/* entropy device */
+
+/* Every buffer the guest offers is filled from the host's random source
+   (getentropy(): the kernel natively, crypto.getRandomValues() in the
+   browser), so the guest's CRNG is seeded as soon as the driver loads
+   instead of waiting for jitter entropy. */
+static int virtio_rng_recv_request(VIRTIODevice *s, int queue_idx,
+                                   int desc_idx, int read_size,
+                                   int write_size)
+{
+    uint8_t *buf;
+    int pos, len;
+
+    buf = malloc(max_int(write_size, 1));
+    for(pos = 0; pos < write_size; pos += len) {
+        len = min_int(write_size - pos, 256); /* getentropy() limit */
+        if (getentropy(buf + pos, len) < 0)
+            break;
+    }
+    memcpy_to_queue(s, queue_idx, desc_idx, 0, buf, pos);
+    free(buf);
+    virtio_consume_desc(s, queue_idx, desc_idx, pos);
+    return 0;
+}
+
+VIRTIODevice *virtio_rng_init(VIRTIOBusDef *bus)
+{
+    VIRTIODevice *s;
+
+    s = mallocz(sizeof(*s));
+    virtio_init(s, bus, 4, 0, virtio_rng_recv_request);
+    return s;
 }
 
 /*********************************************************************/
