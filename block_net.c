@@ -296,6 +296,10 @@ static int bf_rw_async1(BlockDevice *bs, BOOL is_sync)
             bf->sector_index += n;
             bf->sector_num += n;
         } else {
+            /* stop at the end of this cluster: the next one may hold
+               data the guest has written, which the block does not */
+            offset = bf->sector_num % bf->sectors_per_cluster;
+            n = min_int(n, bf->sectors_per_cluster - offset);
             block_num = bf->sector_num / bf->block_size;
             offset = bf->sector_num % bf->block_size;
             n = min_int(n, bf->block_size - offset);
