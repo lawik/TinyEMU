@@ -81,6 +81,7 @@ typedef struct BlockDeviceHTTP {
     int64_t nb_sectors;
     int block_size; /* in sectors, power of two */
     int nb_blocks;
+    uint8_t *zero_map; /* bit set: the block is all zeros and not served */
     struct list_head cached_blocks; /* list of CachedBlock */
     int n_cached_blocks;
     int n_cached_blocks_max;
@@ -267,6 +268,12 @@ static void bf_prefetch_group_onload(void *opaque, int err, void *data,
     free(req);
 }
 
+static BOOL bf_block_is_zero(BlockDeviceHTTP *bf, int block_num)
+{
+    return bf->zero_map &&
+        ((bf->zero_map[block_num >> 3] >> (block_num & 7)) & 1);
+}
+
 static int bf_rw_async1(BlockDevice *bs, BOOL is_sync)
 {
     BlockDeviceHTTP *bf = bs->opaque;
@@ -305,6 +312,27 @@ static int bf_rw_async1(BlockDevice *bs, BOOL is_sync)
             n = min_int(n, bf->block_size - offset);
             bf->cur_block_num = block_num;
             
+            if (bf_block_is_zero(bf, block_num)) {
+                /* known to be all zeros: no need to fetch or cache it */
+                if (bf->is_write) {
+                    int cluster_size = bf->sectors_per_cluster * 512;
+                    uint8_t *zeros = mallocz(cluster_size);
+                    c = mallocz(sizeof(Cluster));
+                    file_buffer_init(&c->fbuf);
+                    file_buffer_resize(&c->fbuf, cluster_size);
+                    file_buffer_write(&c->fbuf, 0, zeros, cluster_size);
+                    free(zeros);
+                    bf->clusters[cluster_num] = c;
+                    bf->n_allocated_clusters++;
+                    continue; /* write to the allocated cluster */
+                }
+                memset(bf->io_buf + bf->sector_index * 512, 0, n * 512);
+                bf->sector_index += n;
+                bf->sector_num += n;
+                bf->cur_block_num = -1;
+                continue;
+            }
+
             b = bf_find_block(bf, block_num);
             if (b) {
                 if (b->state == CBLOCK_LOADING) {
@@ -512,6 +540,37 @@ static void bf_init_onload(void *opaque, int err, void *data, size_t size)
         goto config_error;
     }
     
+    /* optional list of [first block, count] ranges that are all zeros:
+       they are not requested at all (otherwise a 404 also means zeros) */
+    array = json_object_get(cfg, "zero");
+    if (!json_is_undefined(array)) {
+        int idx, first, count, j;
+        JSONValue el;
+
+        if (array.type != JSON_ARRAY) {
+            vm_error("zero: expecting an array\n");
+            goto config_error;
+        }
+        bf->zero_map = mallocz((bf->nb_blocks + 7) / 8);
+        for(idx = 0; idx < array.u.array->len; idx++) {
+            el = json_array_get(array, idx);
+            if (el.type != JSON_ARRAY || el.u.array->len != 2 ||
+                json_array_get(el, 0).type != JSON_INT ||
+                json_array_get(el, 1).type != JSON_INT) {
+                vm_error("zero: expecting [first, count] pairs\n");
+                goto config_error;
+            }
+            first = json_array_get(el, 0).u.int32;
+            count = json_array_get(el, 1).u.int32;
+            if (first < 0 || count < 0 || first + count > bf->nb_blocks) {
+                vm_error("zero: range out of bounds\n");
+                goto config_error;
+            }
+            for(j = first; j < first + count; j++)
+                bf->zero_map[j >> 3] |= 1 << (j & 7);
+        }
+    }
+
     array = json_object_get(cfg, "prefetch");
     if (!json_is_undefined(array)) {
         int idx, prefetch_len, l, i;
