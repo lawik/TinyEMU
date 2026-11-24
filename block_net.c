@@ -49,6 +49,7 @@ typedef struct CachedBlock {
     struct BlockDeviceHTTP *bf;
     unsigned int block_num;
     CachedBlockStateEnum state;
+    BOOL prefetch; /* loading in the background, not for a guest request */
     FileBuffer fbuf;
 } CachedBlock;
 
@@ -108,6 +109,12 @@ typedef struct BlockDeviceHTTP {
 
     /* prefetch */
     int prefetch_group_len;
+    /* with prefetch_group_len == 1, the "prefetch" blocks are loaded in
+       the background in list order, at most prefetch_parallel at a time,
+       while guest requests are served as soon as they come */
+    int *prefetch_queue;
+    int prefetch_len, prefetch_pos;
+    int prefetch_parallel, prefetch_in_flight;
 } BlockDeviceHTTP;
 
 static void bf_update_block(CachedBlock *b, const uint8_t *data);
@@ -118,6 +125,10 @@ static void bf_init_done(BlockDeviceHTTP *bf);
 extern void block_persist_open(BlockDeviceHTTP *bf, const char *disk_id,
                                int cluster_bytes);
 extern void block_persist_dirty(int cluster_num, int fbuf_handle);
+/* provided in lib.js: tell the page what the disk image looks like, so it
+   can report the download of its blocks */
+extern void block_net_info(const char *url, int block_bytes, int n_blocks,
+                           int n_zero_blocks, int n_prefetch_blocks);
 #endif
 static void bf_read_onload(void *opaque, int err, void *data, size_t size);
 static void bf_init_onload(void *opaque, int err, void *data, size_t size);
@@ -183,7 +194,7 @@ static int64_t bf_get_sector_count(BlockDevice *bs)
     return bf->nb_sectors;
 }
 
-static void bf_start_load_block(BlockDevice *bs, int block_num)
+static CachedBlock *bf_start_load_block(BlockDevice *bs, int block_num)
 {
     BlockDeviceHTTP *bf = bs->opaque;
     char filename[1024];
@@ -204,6 +215,29 @@ static void bf_start_load_block(BlockDevice *bs, int block_num)
 #endif
     snprintf(filename, sizeof(filename), BLK_FMT, bf->url, block_num);
     fs_wget(filename, NULL, NULL, b, bf_read_onload, TRUE);
+    return b;
+}
+
+static BOOL bf_block_is_zero(BlockDeviceHTTP *bf, int block_num);
+
+/* start background loads until prefetch_parallel are in flight. Blocks
+   that are cached or loading already (because the guest asked for them)
+   are skipped, and nothing is evicted from the cache to make room. */
+static void bf_prefetch_pump(BlockDeviceHTTP *bf)
+{
+    CachedBlock *b;
+    int block_num;
+
+    while (bf->prefetch_in_flight < bf->prefetch_parallel &&
+           bf->prefetch_pos < bf->prefetch_len &&
+           bf->n_cached_blocks < bf->n_cached_blocks_max) {
+        block_num = bf->prefetch_queue[bf->prefetch_pos++];
+        if (bf_block_is_zero(bf, block_num) || bf_find_block(bf, block_num))
+            continue;
+        b = bf_start_load_block(bf->bs, block_num);
+        b->prefetch = TRUE;
+        bf->prefetch_in_flight++;
+    }
 }
 
 static void bf_start_load_prefetch_group(BlockDevice *bs, int group_num,
@@ -401,21 +435,24 @@ static void bf_read_onload(void *opaque, int err, void *data, size_t size)
     CachedBlock *b = opaque;
     BlockDeviceHTTP *bf = b->bf;
 
+    if (b->prefetch) {
+        b->prefetch = FALSE;
+        bf->prefetch_in_flight--;
+    }
     if (err == -404) {
         /* a block that is not served is all zeros: this lets the server
            skip the empty parts of a disk image */
         void *zeros = mallocz(bf->block_size * 512);
         bf_update_block(b, zeros);
         free(zeros);
-        return;
-    }
-    if (err < 0) {
+    } else if (err < 0) {
         fprintf(stderr, "Could not load block %u\n", b->block_num);
         exit(1);
+    } else {
+        assert(size == bf->block_size * 512);
+        bf_update_block(b, data);
     }
-    
-    assert(size == bf->block_size * 512);
-    bf_update_block(b, data);
+    bf_prefetch_pump(bf);
 }
 
 static int bf_read_async(BlockDevice *bs,
@@ -491,7 +528,7 @@ static void bf_init_onload(void *opaque, int err, void *data, size_t size)
 {
     BlockDevice *bs = opaque;
     BlockDeviceHTTP *bf = bs->opaque;
-    int block_size_kb, block_num;
+    int block_size_kb;
     JSONValue cfg, array;
     
     if (err < 0) {
@@ -571,6 +608,12 @@ static void bf_init_onload(void *opaque, int err, void *data, size_t size)
         }
     }
 
+    if (vm_get_int_opt(cfg, "prefetch_parallel",
+                       &bf->prefetch_parallel, 4) < 0)
+        goto config_error;
+    if (bf->prefetch_parallel < 1)
+        bf->prefetch_parallel = 1;
+
     array = json_object_get(cfg, "prefetch");
     if (!json_is_undefined(array)) {
         int idx, prefetch_len, l, i;
@@ -582,27 +625,37 @@ static void bf_init_onload(void *opaque, int err, void *data, size_t size)
             goto config_error;
         }
         prefetch_len = array.u.array->len;
-        idx = 0;
-        while (idx < prefetch_len) {
-            l = min_int(prefetch_len - idx, bf->prefetch_group_len);
-            for(i = 0; i < l; i++) {
-                el = json_array_get(array, idx + i);
-                if (el.type != JSON_INT) {
-                    vm_error("expecting an integer\n");
-                    goto config_error;
-                }
-                tab_block_num[i] = el.u.int32;
+        for(idx = 0; idx < prefetch_len; idx++) {
+            el = json_array_get(array, idx);
+            if (el.type != JSON_INT || el.u.int32 < 0 ||
+                el.u.int32 >= bf->nb_blocks) {
+                vm_error("prefetch: expecting block numbers\n");
+                goto config_error;
             }
-            if (l == 1) {
-                block_num = tab_block_num[0];
-                if (!bf_find_block(bf, block_num)) {
-                    bf_start_load_block(bs, block_num);
+        }
+        if (bf->prefetch_group_len == 1) {
+            /* loaded in the background by bf_prefetch_pump() */
+            bf->prefetch_queue = malloc(sizeof(int) * max_int(1, prefetch_len));
+            for(idx = 0; idx < prefetch_len; idx++)
+                bf->prefetch_queue[idx] = json_array_get(array, idx).u.int32;
+            bf->prefetch_len = prefetch_len;
+        } else {
+            /* the groups are requested all at once */
+            idx = 0;
+            while (idx < prefetch_len) {
+                l = min_int(prefetch_len - idx, bf->prefetch_group_len);
+                for(i = 0; i < l; i++)
+                    tab_block_num[i] = json_array_get(array, idx + i).u.int32;
+                if (l == 1) {
+                    if (!bf_find_block(bf, tab_block_num[0]))
+                        bf_start_load_block(bs, tab_block_num[0]);
+                } else {
+                    bf_start_load_prefetch_group(bs,
+                                                 idx / bf->prefetch_group_len,
+                                                 tab_block_num, l);
                 }
-            } else {
-                bf_start_load_prefetch_group(bs, idx / bf->prefetch_group_len,
-                                             tab_block_num, l);
+                idx += l;
             }
-            idx += l;
         }
     }
     {
@@ -616,6 +669,19 @@ static void bf_init_onload(void *opaque, int err, void *data, size_t size)
         }
     }
     json_free(cfg);
+
+#ifdef __EMSCRIPTEN__
+    {
+        int i, n_zero = 0;
+        for(i = 0; i < bf->nb_blocks; i++)
+            n_zero += bf_block_is_zero(bf, i);
+        block_net_info(bf->url, bf->block_size * 512, bf->nb_blocks, n_zero,
+                       bf->prefetch_len);
+    }
+#endif
+    /* start the background loads: they run while the persisted clusters
+       are restored and the machine boots */
+    bf_prefetch_pump(bf);
 
 #ifdef __EMSCRIPTEN__
     /* restore the clusters written in earlier sessions, then start */

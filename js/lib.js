@@ -21,6 +21,20 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+/* Everything the emulator tells the page goes through optional callbacks on
+   Module (set by nerves-vm.js before the emulator script loads):
+
+   onConsoleOutput(str)    console output (byte values as chars)
+   getConsoleSize()        [cols, rows] of the console
+   onFetch(ev)             {id, url, phase: "start"|"progress"|"done"|"error",
+                            loaded, total, status} for every HTTP request
+   onDiskInfo(info)        {url, blockBytes, blocks, zeroBlocks,
+                            prefetchBlocks} once blk.txt is parsed
+   onDiskPersist(info)     {status, saved_bytes, restored_bytes}
+   onDownloading(flag)     true while any request is outstanding
+   onNetPacket(bytes)      an Ethernet frame sent by the guest
+   onReset()               the guest rebooted the machine (riscv_machine.c)
+   onPowerOff(status)      the guest powered the machine off */
 mergeInto(LibraryManager.library, {
     $WgetState: {
         nextHandle: 1,
@@ -33,13 +47,14 @@ mergeInto(LibraryManager.library, {
         /* Note: we really send byte values. It would be up to the
          * terminal to support UTF-8 */
         str = String.fromCharCode.apply(String, HEAPU8.subarray(buf, buf + len));
-        term.write(str);
+        if (Module.onConsoleOutput)
+            Module.onConsoleOutput(str);
     },
 
     console_get_size: function(pw, ph)
     {
         var w, h, r;
-        r = term.getSize();
+        r = Module.getConsoleSize ? Module.getConsoleSize() : [80, 30];
         HEAPU32[pw >> 2] = r[0];
         HEAPU32[ph >> 2] = r[1];
     },
@@ -88,6 +103,12 @@ mergeInto(LibraryManager.library, {
       }
         
     var handle = WgetState.nextHandle++;
+    var report = function(phase, loaded, total, status) {
+        if (Module.onFetch) {
+            Module.onFetch({ id: handle, url: _url, phase: phase,
+                             loaded: loaded, total: total, status: status });
+        }
+    };
 
     // LOAD
     http.onload = function http_onload(e) {
@@ -95,11 +116,13 @@ mergeInto(LibraryManager.library, {
          else that is not 200 (e.g. 404) is an error */
       if (http.status == 200 || (http.status == 0 && location.protocol != "http:" && location.protocol != "https:")) {
         var byteArray = new Uint8Array(http.response);
+        report("done", byteArray.length, byteArray.length, http.status);
         var buffer = _malloc(byteArray.length);
         HEAPU8.set(byteArray, buffer);
         if (onload) dynCall('viiii', onload, [handle, arg, buffer, byteArray.length]);
         if (free) _free(buffer);
       } else {
+        report("error", 0, 0, http.status);
         if (onerror) dynCall('viiii', onerror, [handle, arg, http.status, http.statusText]);
       }
       delete WgetState.requests[handle];
@@ -107,6 +130,7 @@ mergeInto(LibraryManager.library, {
 
     // ERROR
     http.onerror = function http_onerror(e) {
+      report("error", 0, 0, http.status);
       if (onerror) {
         dynCall('viiii', onerror, [handle, arg, http.status, http.statusText]);
       }
@@ -115,6 +139,7 @@ mergeInto(LibraryManager.library, {
 
     // PROGRESS
     http.onprogress = function http_onprogress(e) {
+      report("progress", e.loaded, e.lengthComputable ? e.total : 0, http.status);
       if (onprogress) dynCall('viiii', onprogress, [handle, arg, e.loaded, e.lengthComputable || e.lengthComputable === undefined ? e.total : 0]);
     };
 
@@ -139,6 +164,7 @@ mergeInto(LibraryManager.library, {
     } else {
       http.send(null);
     }
+    report("start", 0, 0, 0);
 
     WgetState.requests[handle] = http;
 
@@ -149,7 +175,7 @@ mergeInto(LibraryManager.library, {
      IndexedDB and restored before the VM starts. One database holds the
      clusters of a single disk image, keyed by [disk id, cluster number];
      clusters of other disk ids are discarded on open. The page may define
-     update_disk_persist(info) to show the state. */
+     Module.onDiskPersist(info) to show the state. */
   $DiskPersist: {
       db: null,
       id: null,
@@ -166,8 +192,8 @@ mergeInto(LibraryManager.library, {
   $disk_persist_notify: function()
   {
       var P = DiskPersist;
-      if (typeof update_disk_persist == "function") {
-          update_disk_persist({ status: P.status,
+      if (Module.onDiskPersist) {
+          Module.onDiskPersist({ status: P.status,
                                 saved_bytes: P.n_saved * P.cluster_bytes,
                                 restored_bytes: P.n_restored * P.cluster_bytes });
       }
@@ -328,7 +354,17 @@ mergeInto(LibraryManager.library, {
 
   fs_wget_update_downloading: function (flag)
   {
-      update_downloading(Boolean(flag));
+      if (Module.onDownloading)
+          Module.onDownloading(Boolean(flag));
+  },
+
+  block_net_info: function(url, block_bytes, n_blocks, n_zero, n_prefetch)
+  {
+      if (Module.onDiskInfo) {
+          Module.onDiskInfo({ url: UTF8ToString(url), blockBytes: block_bytes,
+                              blocks: n_blocks, zeroBlocks: n_zero,
+                              prefetchBlocks: n_prefetch });
+      }
   },
     
   fb_refresh: function(opaque, data, x, y, w, h, stride)
@@ -361,8 +397,9 @@ mergeInto(LibraryManager.library, {
 
   net_recv_packet: function(bs, buf, buf_len)
   {
-      if (net_state) {
-          net_state.recv_packet(HEAPU8.subarray(buf, buf + buf_len));
+      if (Module.onNetPacket) {
+          /* a copy: the adapter may keep it after the call returns */
+          Module.onNetPacket(HEAPU8.slice(buf, buf + buf_len));
       }
   },
 

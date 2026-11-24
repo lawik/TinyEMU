@@ -165,8 +165,7 @@ static void riscv_machine_power_off(RISCVMachine *s, int status)
     /* exit() cannot stop the browser's event loop: stop running the
        CPU and let the page say so */
     s->halted = TRUE;
-    EM_ASM({ if (typeof vm_power_off == "function") vm_power_off($0); },
-           status);
+    EM_ASM({ if (Module.onPowerOff) Module.onPowerOff($0); }, status);
 #else
     printf("\nPower off.\n");
     exit(status);
@@ -1187,6 +1186,9 @@ static void riscv_machine_reset(RISCVMachine *s)
     memset(get_ram_ptr(s, 0, TRUE), 0, LOW_RAM_SIZE);
     copy_bios(s, s->bios_buf, s->bios_len, s->kernel_buf, s->kernel_len,
               s->initrd_buf, s->initrd_len, s->cmdline);
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ if (Module.onReset) Module.onReset(); });
+#endif
 }
 
 /* a reset waits until no block request is outstanding */
