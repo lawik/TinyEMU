@@ -185,6 +185,13 @@ static void virtio_reset(VIRTIODevice *s)
     }
 }
 
+/* machine reset: as if the driver had written 0 to the status register */
+void virtio_device_reset(VIRTIODevice *s)
+{
+    set_irq(s->irq, 0);
+    virtio_reset(s);
+}
+
 static uint8_t *virtio_pci_get_ram_ptr(VIRTIODevice *s, virtio_phys_addr_t paddr, BOOL is_rw)
 {
     return pci_device_get_dma_ptr(s->pci_dev, paddr, is_rw);
@@ -1130,6 +1137,13 @@ static int virtio_block_recv_request(VIRTIODevice *s, int queue_idx,
         break;
     }
     return 0;
+}
+
+/* TRUE while an asynchronous read or write is outstanding: its completion
+   writes to the guest's queue, so the machine must not be reset under it */
+BOOL virtio_block_busy(VIRTIODevice *s)
+{
+    return ((VIRTIOBlockDevice *)s)->req_in_progress;
 }
 
 VIRTIODevice *virtio_block_init(VIRTIOBusDef *bus, BlockDevice *bs)

@@ -37,8 +37,13 @@
 #include "riscv_cpu.h"
 #include "virtio.h"
 #include "machine.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 /* RISCV machine */
+
+#define MAX_VIRTIO_DEVICES 31 /* one PLIC interrupt each */
 
 typedef struct RISCVMachine {
     VirtMachine common;
@@ -61,12 +66,24 @@ typedef struct RISCVMachine {
     VIRTIODevice *mouse_dev;
 
     int virtio_count;
+    VIRTIODevice *virtio_devs[MAX_VIRTIO_DEVICES];
+    int blk_count;
+    VIRTIODevice *blk_devs[MAX_DRIVE_DEVICE];
+
+    /* what copy_bios() needs again on a machine reset */
+    uint8_t *bios_buf, *kernel_buf, *initrd_buf;
+    int bios_len, kernel_len, initrd_len;
+    char *cmdline;
+    BOOL reset_pending; /* the guest asked for a reboot */
+    BOOL halted; /* the guest powered the machine off */
 } RISCVMachine;
 
 #define LOW_RAM_SIZE   0x00010000 /* 64KB */
 #define RAM_BASE_ADDR  0x80000000
 #define CLINT_BASE_ADDR 0x02000000
 #define CLINT_SIZE      0x000c0000
+#define SYSCON_BASE_ADDR 0x00100000 /* "sifive,test0" finisher, as on QEMU virt */
+#define SYSCON_SIZE      0x1000
 #define HTIF_BASE_ADDR 0x40008000
 #define IDE_BASE_ADDR  0x40009000
 #define VIRTIO_BASE_ADDR 0x40010000
@@ -132,6 +149,65 @@ static uint32_t htif_read(void *opaque, uint32_t offset,
     return val;
 }
 
+static uint8_t *memdup(const uint8_t *buf, int len)
+{
+    uint8_t *p;
+    if (!buf || len <= 0)
+        return NULL;
+    p = malloc(len);
+    memcpy(p, buf, len);
+    return p;
+}
+
+static void riscv_machine_power_off(RISCVMachine *s, int status)
+{
+#ifdef __EMSCRIPTEN__
+    /* exit() cannot stop the browser's event loop: stop running the
+       CPU and let the page say so */
+    s->halted = TRUE;
+    EM_ASM({ if (typeof vm_power_off == "function") vm_power_off($0); },
+           status);
+#else
+    printf("\nPower off.\n");
+    exit(status);
+#endif
+}
+
+/* The QEMU virt "test" device: OpenSBI's syscon-reboot and syscon-poweroff
+   drivers (see the reboot and poweroff nodes in the device tree) write
+   0x7777 to reset the machine and 0x5555 to power it off. 0x3333 is a
+   power off with an exit status in the upper 16 bits. */
+#define SYSCON_FINISHER_FAIL  0x3333
+#define SYSCON_FINISHER_PASS  0x5555
+#define SYSCON_FINISHER_RESET 0x7777
+
+static uint32_t syscon_read(void *opaque, uint32_t offset, int size_log2)
+{
+    return 0;
+}
+
+static void syscon_write(void *opaque, uint32_t offset, uint32_t val,
+                         int size_log2)
+{
+    RISCVMachine *s = opaque;
+
+    if (offset != 0)
+        return;
+    switch (val & 0xffff) {
+    case SYSCON_FINISHER_RESET:
+        s->reset_pending = TRUE;
+        break;
+    case SYSCON_FINISHER_PASS:
+        riscv_machine_power_off(s, 0);
+        break;
+    case SYSCON_FINISHER_FAIL:
+        riscv_machine_power_off(s, val >> 16);
+        break;
+    default:
+        break;
+    }
+}
+
 static void htif_handle_cmd(RISCVMachine *s)
 {
     uint32_t device, cmd;
@@ -140,8 +216,8 @@ static void htif_handle_cmd(RISCVMachine *s)
     cmd = (s->htif_tohost >> 48) & 0xff;
     if (s->htif_tohost == 1) {
         /* shuthost */
-        printf("\nPower off.\n");
-        exit(0);
+        s->htif_tohost = 0;
+        riscv_machine_power_off(s, 0);
     } else if (device == 1 && cmd == 1) {
         uint8_t buf[1];
         buf[0] = s->htif_tohost & 0xff;
@@ -624,6 +700,7 @@ static int riscv_build_fdt(RISCVMachine *m, uint8_t *dst,
 {
     FDTState *s;
     int size, max_xlen, i, cur_phandle, intc_phandle, plic_phandle;
+    int syscon_phandle;
     char isa_string[128], *q;
     uint32_t misa;
     uint32_t tab[8];
@@ -744,6 +821,14 @@ static int riscv_build_fdt(RISCVMachine *m, uint8_t *dst,
     
     fdt_end_node(s); /* clint */
 
+    fdt_begin_node_num(s, "test", SYSCON_BASE_ADDR);
+    fdt_prop_tab_str(s, "compatible", "sifive,test1", "sifive,test0",
+                     "syscon", NULL);
+    fdt_prop_tab_u64_2(s, "reg", SYSCON_BASE_ADDR, SYSCON_SIZE);
+    syscon_phandle = cur_phandle++;
+    fdt_prop_u32(s, "phandle", syscon_phandle);
+    fdt_end_node(s); /* test */
+
     fdt_begin_node_num(s, "plic", PLIC_BASE_ADDR);
     fdt_prop_u32(s, "#interrupt-cells", 1);
     fdt_prop(s, "interrupt-controller", NULL, 0);
@@ -786,6 +871,20 @@ static int riscv_build_fdt(RISCVMachine *m, uint8_t *dst,
     }
     
     fdt_end_node(s); /* soc */
+
+    fdt_begin_node(s, "reboot");
+    fdt_prop_str(s, "compatible", "syscon-reboot");
+    fdt_prop_u32(s, "regmap", syscon_phandle);
+    fdt_prop_u32(s, "offset", 0);
+    fdt_prop_u32(s, "value", SYSCON_FINISHER_RESET);
+    fdt_end_node(s); /* reboot */
+
+    fdt_begin_node(s, "poweroff");
+    fdt_prop_str(s, "compatible", "syscon-poweroff");
+    fdt_prop_u32(s, "regmap", syscon_phandle);
+    fdt_prop_u32(s, "offset", 0);
+    fdt_prop_u32(s, "value", SYSCON_FINISHER_PASS);
+    fdt_end_node(s); /* poweroff */
 
     fdt_begin_node(s, "chosen");
     fdt_prop_str(s, "bootargs", cmd_line ? cmd_line : "");
@@ -950,6 +1049,8 @@ static VirtMachine *riscv_machine_init(const VirtMachineParams *p)
 
     cpu_register_device(s->mem_map, HTIF_BASE_ADDR, 16,
                         s, htif_read, htif_write, DEVIO_SIZE32);
+    cpu_register_device(s->mem_map, SYSCON_BASE_ADDR, SYSCON_SIZE,
+                        s, syscon_read, syscon_write, DEVIO_SIZE32);
     s->common.console = p->console;
 
     memset(vbus, 0, sizeof(*vbus));
@@ -961,29 +1062,29 @@ static VirtMachine *riscv_machine_init(const VirtMachineParams *p)
     if (p->console) {
         vbus->irq = &s->plic_irq[irq_num];
         s->common.console_dev = virtio_console_init(vbus, p->console);
+        s->virtio_devs[s->virtio_count++] = s->common.console_dev;
         vbus->addr += VIRTIO_SIZE;
         irq_num++;
-        s->virtio_count++;
     }
     
     /* virtio net device */
     for(i = 0; i < p->eth_count; i++) {
         vbus->irq = &s->plic_irq[irq_num];
-        virtio_net_init(vbus, p->tab_eth[i].net);
+        s->virtio_devs[s->virtio_count++] =
+            virtio_net_init(vbus, p->tab_eth[i].net);
         s->common.net = p->tab_eth[i].net;
         vbus->addr += VIRTIO_SIZE;
         irq_num++;
-        s->virtio_count++;
     }
 
     /* virtio block device */
     for(i = 0; i < p->drive_count; i++) {
         vbus->irq = &s->plic_irq[irq_num];
         blk_dev = virtio_block_init(vbus, p->tab_drive[i].block_dev);
-        (void)blk_dev;
+        s->virtio_devs[s->virtio_count++] = blk_dev;
+        s->blk_devs[s->blk_count++] = blk_dev;
         vbus->addr += VIRTIO_SIZE;
         irq_num++;
-        s->virtio_count++;
     }
 
     /* virtio filesystem */
@@ -992,11 +1093,10 @@ static VirtMachine *riscv_machine_init(const VirtMachineParams *p)
         vbus->irq = &s->plic_irq[irq_num];
         fs_dev = virtio_9p_init(vbus, p->tab_fs[i].fs_dev,
                                 p->tab_fs[i].tag);
-        (void)fs_dev;
+        s->virtio_devs[s->virtio_count++] = fs_dev;
         //        virtio_set_debug(fs_dev, VIRTIO_DEBUG_9P);
         vbus->addr += VIRTIO_SIZE;
         irq_num++;
-        s->virtio_count++;
     }
 
     if (p->display_device) {
@@ -1020,16 +1120,16 @@ static VirtMachine *riscv_machine_init(const VirtMachineParams *p)
             vbus->irq = &s->plic_irq[irq_num];
             s->keyboard_dev = virtio_input_init(vbus,
                                                 VIRTIO_INPUT_TYPE_KEYBOARD);
+            s->virtio_devs[s->virtio_count++] = s->keyboard_dev;
             vbus->addr += VIRTIO_SIZE;
             irq_num++;
-            s->virtio_count++;
 
             vbus->irq = &s->plic_irq[irq_num];
             s->mouse_dev = virtio_input_init(vbus,
                                              VIRTIO_INPUT_TYPE_TABLET);
+            s->virtio_devs[s->virtio_count++] = s->mouse_dev;
             vbus->addr += VIRTIO_SIZE;
             irq_num++;
-            s->virtio_count++;
         } else {
             vm_error("unsupported input device: %s\n", p->input_device);
             exit(1);
@@ -1040,12 +1140,57 @@ static VirtMachine *riscv_machine_init(const VirtMachineParams *p)
         vm_error("No bios found");
     }
 
-    copy_bios(s, p->files[VM_FILE_BIOS].buf, p->files[VM_FILE_BIOS].len,
-              p->files[VM_FILE_KERNEL].buf, p->files[VM_FILE_KERNEL].len,
-              p->files[VM_FILE_INITRD].buf, p->files[VM_FILE_INITRD].len,
-              p->cmdline);
+    /* the config (and these buffers) is freed once the machine is up,
+       but a reset needs them again */
+    s->bios_len = p->files[VM_FILE_BIOS].len;
+    s->bios_buf = memdup(p->files[VM_FILE_BIOS].buf, s->bios_len);
+    s->kernel_len = p->files[VM_FILE_KERNEL].len;
+    s->kernel_buf = memdup(p->files[VM_FILE_KERNEL].buf, s->kernel_len);
+    s->initrd_len = p->files[VM_FILE_INITRD].len;
+    s->initrd_buf = memdup(p->files[VM_FILE_INITRD].buf, s->initrd_len);
+    s->cmdline = p->cmdline ? strdup(p->cmdline) : NULL;
+
+    copy_bios(s, s->bios_buf, s->bios_len, s->kernel_buf, s->kernel_len,
+              s->initrd_buf, s->initrd_len, s->cmdline);
     
     return (VirtMachine *)s;
+}
+
+/* Reboot: put the CPU, the interrupt controllers, HTIF and the virtio
+   devices back in their power-on state and load the firmware again, as a
+   cold boot would. The disks keep their contents. */
+static void riscv_machine_reset(RISCVMachine *s)
+{
+    int i;
+
+    s->reset_pending = FALSE;
+    for(i = 0; i < s->virtio_count; i++)
+        virtio_device_reset(s->virtio_devs[i]);
+    s->plic_pending_irq = 0;
+    s->plic_served_irq = 0;
+    s->htif_tohost = 0;
+    s->htif_fromhost = 0;
+    s->htif_kbd_wanted = FALSE;
+    s->timecmp = 0;
+    riscv_cpu_reset(s->cpu_state);
+    if (s->rtc_real_time)
+        s->rtc_start_time = rtc_get_real_time(s);
+
+    memset(get_ram_ptr(s, RAM_BASE_ADDR, TRUE), 0, s->ram_size);
+    memset(get_ram_ptr(s, 0, TRUE), 0, LOW_RAM_SIZE);
+    copy_bios(s, s->bios_buf, s->bios_len, s->kernel_buf, s->kernel_len,
+              s->initrd_buf, s->initrd_len, s->cmdline);
+}
+
+/* a reset waits until no block request is outstanding */
+static BOOL riscv_machine_reset_ready(RISCVMachine *s)
+{
+    int i;
+    for(i = 0; i < s->blk_count; i++) {
+        if (virtio_block_busy(s->blk_devs[i]))
+            return FALSE;
+    }
+    return TRUE;
 }
 
 static void riscv_machine_end(VirtMachine *s1)
@@ -1054,6 +1199,10 @@ static void riscv_machine_end(VirtMachine *s1)
     /* XXX: stop all */
     riscv_cpu_end(s->cpu_state);
     phys_mem_map_end(s->mem_map);
+    free(s->bios_buf);
+    free(s->kernel_buf);
+    free(s->initrd_buf);
+    free(s->cmdline);
     free(s);
 }
 
@@ -1064,6 +1213,10 @@ static int riscv_machine_get_sleep_duration(VirtMachine *s1, int delay)
     RISCVCPUState *s = m->cpu_state;
     int64_t delay1;
     
+    if (m->halted)
+        return delay;
+    if (m->reset_pending)
+        return riscv_machine_reset_ready(m) ? 0 : delay;
     /* wait for an event: the only asynchronous event is the RTC timer */
     if (!(riscv_cpu_get_mip(s) & MIP_MTIP)) {
         delay1 = m->timecmp - rtc_get_time(m);
@@ -1085,6 +1238,13 @@ static int riscv_machine_get_sleep_duration(VirtMachine *s1, int delay)
 static void riscv_machine_interp(VirtMachine *s1, int max_exec_cycle)
 {
     RISCVMachine *s = (RISCVMachine *)s1;
+    if (s->halted)
+        return;
+    if (s->reset_pending) {
+        if (!riscv_machine_reset_ready(s))
+            return;
+        riscv_machine_reset(s);
+    }
     riscv_cpu_interp(s->cpu_state, max_exec_cycle);
 }
 

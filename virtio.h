@@ -58,6 +58,7 @@ typedef struct VIRTIODevice VIRTIODevice;
 #define VIRTIO_DEBUG_9P (1 << 1)
 
 void virtio_set_debug(VIRTIODevice *s, int debug_flags);
+void virtio_device_reset(VIRTIODevice *s);
 
 /* block device */
 
@@ -77,6 +78,7 @@ struct BlockDevice {
 };
 
 VIRTIODevice *virtio_block_init(VIRTIOBusDef *bus, BlockDevice *bs);
+BOOL virtio_block_busy(VIRTIODevice *s);
 
 /* network device */
 

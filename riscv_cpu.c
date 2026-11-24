@@ -1390,16 +1390,15 @@ static BOOL glue(riscv_cpu_get_power_down, MAX_XLEN)(RISCVCPUState *s)
     return s->power_down_flag;
 }
 
-static RISCVCPUState *glue(riscv_cpu_init, MAX_XLEN)(PhysMemoryMap *mem_map)
+/* put the hart in its power-on state (M-mode, pc at the boot ROM). The
+   machine-provided fields in 'common' and the memory map are kept. */
+static void glue(riscv_cpu_reset, MAX_XLEN)(RISCVCPUState *s)
 {
-    RISCVCPUState *s;
-    
-#ifdef USE_GLOBAL_STATE
-    s = &riscv_cpu_global_state;
-#else
-    s = mallocz(sizeof(*s));
-#endif
-    s->common.class_ptr = &glue(riscv_cpu_class, MAX_XLEN);
+    RISCVCPUCommonState common = s->common;
+    PhysMemoryMap *mem_map = s->mem_map;
+
+    memset(s, 0, sizeof(*s));
+    s->common = common;
     s->mem_map = mem_map;
     s->pc = 0x1000;
     s->priv = PRV_M;
@@ -1421,6 +1420,21 @@ static RISCVCPUState *glue(riscv_cpu_init, MAX_XLEN)(PhysMemoryMap *mem_map)
     s->misa |= MCPUID_C;
 #endif
     tlb_init(s);
+}
+
+static RISCVCPUState *glue(riscv_cpu_init, MAX_XLEN)(PhysMemoryMap *mem_map)
+{
+    RISCVCPUState *s;
+    
+#ifdef USE_GLOBAL_STATE
+    s = &riscv_cpu_global_state;
+#else
+    s = mallocz(sizeof(*s));
+#endif
+    memset(s, 0, sizeof(*s));
+    s->common.class_ptr = &glue(riscv_cpu_class, MAX_XLEN);
+    s->mem_map = mem_map;
+    glue(riscv_cpu_reset, MAX_XLEN)(s);
     return s;
 }
 
@@ -1439,6 +1453,7 @@ static uint32_t glue(riscv_cpu_get_misa, MAX_XLEN)(RISCVCPUState *s)
 const RISCVCPUClass glue(riscv_cpu_class, MAX_XLEN) = {
     glue(riscv_cpu_init, MAX_XLEN),
     glue(riscv_cpu_end, MAX_XLEN),
+    glue(riscv_cpu_reset, MAX_XLEN),
     glue(riscv_cpu_interp, MAX_XLEN),
     glue(riscv_cpu_get_cycles, MAX_XLEN),
     glue(riscv_cpu_set_mip, MAX_XLEN),
