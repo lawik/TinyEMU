@@ -40,6 +40,14 @@
                            {url, phase: "start"|"progress"|"restored"|
                             "skipped"|"error", loaded, total, extra, message}
    snapshot                false: never restore a snapshot
+   waitForDisk             false: run the machine while the disk image is
+                           still downloading (blocks it needs first are
+                           fetched right away); by default it starts once
+                           the whole image is local (and the snapshot, if
+                           any, is restored)
+   onWaiting(info)         {disk, snapshot}: what the machine waits for
+                           before it runs
+   onRun(info)             {restored}: the machine starts running
    onSnapshotSaved(bytes)  the result of ccall("vm_snapshot_save"): the
                            snapshot file, or null if the machine is busy
                            (try again); snapshotExtra (a Uint8Array) is
@@ -597,10 +605,27 @@ mergeInto(LibraryManager.library, {
           }) });
   },
 
-  snapshot_fetch: function(url_ptr)
+  disk_wait_wanted: function()
+  {
+      return Module.waitForDisk === false ? 0 : 1;
+  },
+
+  vm_wait_notify: function(disk, snapshot)
+  {
+      if (Module.onWaiting)
+          Module.onWaiting({ disk: !!disk, snapshot: !!snapshot });
+  },
+
+  vm_run_notify: function(restored)
+  {
+      if (Module.onRun)
+          Module.onRun({ restored: !!restored });
+  },
+
+  snapshot_fetch: function(url_ptr, size)
   {
       var url = UTF8ToString(url_ptr);
-      var touched = false, state_ptr = 0, loaded = 0, total = 0;
+      var touched = false, state_ptr = 0, loaded = 0, total = size;
 
       function report(info)
       {
@@ -652,7 +677,7 @@ mergeInto(LibraryManager.library, {
           resp = await fetch(url);
           if (!resp.ok)
               throw new Error("HTTP " + resp.status);
-          total = +(resp.headers.get("Content-Length") || 0);
+          total = +(resp.headers.get("Content-Length") || 0) || size;
           body = resp.body.pipeThrough(new TransformStream({
               transform: function(chunk, ctl) {
                   var now = performance.now();
@@ -739,7 +764,7 @@ mergeInto(LibraryManager.library, {
           _vm_snapshot_done(0);
           return;
       }
-      report({ phase: "start" });
+      report({ phase: "start", loaded: 0, total: size });
       restore().then(function(extra) {
           report({ phase: "restored", loaded: loaded, total: total,
                    extra: extra });

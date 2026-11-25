@@ -125,7 +125,12 @@ typedef struct BlockDeviceHTTP {
        wait until the frontend has restored it (or decided not to), so the
        two downloads do not compete. */
     char snapshot_url[1100];
+    int snapshot_size; /* bytes, 0 if blk.txt does not say */
     BOOL prefetch_started;
+    /* called once every prefetch block is loaded (the whole image is
+       local), see block_net_start_prefetch() */
+    void (*ready_cb)(void *opaque);
+    void *ready_opaque;
     /* after a restore the guest needs few blocks, but needs them now: the
        background loads then yield to it (block_net_start_prefetch()) */
     BOOL yield_to_guest;
@@ -303,6 +308,14 @@ static void bf_prefetch_pump(BlockDeviceHTTP *bf)
         b = bf_start_load_block(bf->bs, block_num);
         b->prefetch = TRUE;
         bf->prefetch_in_flight++;
+    }
+    /* everything is loaded (or the cache cannot hold more) */
+    if (bf->ready_cb && bf->prefetch_in_flight == 0 &&
+        (bf->prefetch_pos >= bf->prefetch_len ||
+         bf->n_cached_blocks >= bf->n_cached_blocks_max)) {
+        void (*cb)(void *opaque) = bf->ready_cb;
+        bf->ready_cb = NULL;
+        cb(bf->ready_opaque);
     }
 }
 
@@ -745,6 +758,8 @@ static void bf_init_onload(void *opaque, int err, void *data, size_t size)
         if (snap.type == JSON_STR) {
             snprintf(bf->snapshot_url, sizeof(bf->snapshot_url), "%s%s",
                      bf->url, snap.u.str->data);
+            if (vm_get_int_opt(cfg, "snapshot_size", &bf->snapshot_size, 0) < 0)
+                goto config_error;
         }
     }
     json_free(cfg);
@@ -822,20 +837,32 @@ const char *block_net_get_snapshot_url(BlockDevice *bs)
     return bf->snapshot_url;
 }
 
-/* start the background loads; with yield_to_guest (after a restore) at
-   most two at a time, and none starts while a guest request waits for a
-   block or within YIELD_MS of one */
-void block_net_start_prefetch(BlockDevice *bs, BOOL yield_to_guest)
+int block_net_get_snapshot_size(BlockDevice *bs)
 {
     BlockDeviceHTTP *bf = bs->opaque;
+    return bf->snapshot_size;
+}
+
+/* start the background loads of blk.txt's prefetch list; ready_cb (if not
+   NULL) is called once they are all loaded. With yield_to_guest (a guest
+   that runs while they load, after a restore) at most two load at a time,
+   and none starts while a guest request waits for a block or within
+   YIELD_MS of one */
+void block_net_start_prefetch(BlockDevice *bs, BOOL yield_to_guest,
+                              void (*ready_cb)(void *opaque), void *opaque)
+{
+    BlockDeviceHTTP *bf = bs->opaque;
+    if (ready_cb) {
+        bf->ready_cb = ready_cb;
+        bf->ready_opaque = opaque;
+    }
     if (yield_to_guest) {
         bf->yield_to_guest = TRUE;
         bf->prefetch_parallel = min_int(bf->prefetch_parallel, 2);
     }
-    if (!bf->prefetch_started) {
+    if (!bf->prefetch_started)
         bf->prefetch_started = TRUE;
-        bf_prefetch_pump(bf);
-    }
+    bf_prefetch_pump(bf);
 }
 
 #ifdef __EMSCRIPTEN__

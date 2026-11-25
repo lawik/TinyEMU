@@ -49,9 +49,15 @@ extern void fb_refresh(void *opaque, void *data,
                        int x, int y, int w, int h, int stride);
 extern void net_recv_packet(EthernetDevice *bs,
                             const uint8_t *buf, int len);
-/* fetch the snapshot and restore it (vm_snapshot_*), then call
-   vm_snapshot_done() */
-extern void snapshot_fetch(const char *url);
+/* fetch the snapshot (size bytes if known, else 0) and restore it
+   (vm_snapshot_*), then call vm_snapshot_done() */
+extern void snapshot_fetch(const char *url, int size);
+/* TRUE unless the page wants the machine to run while the disk image is
+   still downloading (Module.waitForDisk = false) */
+extern int disk_wait_wanted(void);
+/* tell the page what the machine waits for, and when it starts running */
+extern void vm_wait_notify(int disk, int snapshot);
+extern void vm_run_notify(int restored);
 /* hand a saved snapshot (state, then the RAM) to the page */
 extern void snapshot_write(const uint8_t *state, int state_len);
 
@@ -185,7 +191,12 @@ typedef struct {
 static void init_vm(void *arg);
 static void init_vm_fs(void *arg);
 static void init_vm_drive(void *arg);
-static void vm_run(VirtMachine *m, BOOL restored);
+static void vm_maybe_run(void);
+static void vm_disk_ready(void *opaque);
+
+/* the machine starts once these are done: the disk image is local (unless
+   the page asked otherwise) and the snapshot, if any, is restored */
+static BOOL wait_disk, wait_snapshot, vm_running, vm_restored;
 
 void vm_start(const char *url, int ram_size, const char *cmdline,
               const char *pwd, int width, int height, BOOL has_network)
@@ -303,20 +314,37 @@ static void init_vm(void *arg)
     free(s);
 
     snapshot_url = global_drive ? block_net_get_snapshot_url(global_drive) : NULL;
-    if (snapshot_url && m->vmc->vm_load_state) {
-        /* restore a saved machine instead of booting: vm_snapshot_done()
-           starts it */
-        snapshot_fetch(snapshot_url);
-    } else {
-        vm_run(m, FALSE);
+    wait_snapshot = snapshot_url && m->vmc->vm_load_state;
+    wait_disk = global_drive && disk_wait_wanted();
+    vm_wait_notify(wait_disk, wait_snapshot);
+    /* download the disk image first, at the same time as the snapshot:
+       the machine then never waits for the network. Otherwise the image
+       loads in the background, after the snapshot */
+    if (global_drive && (wait_disk || !wait_snapshot))
+        block_net_start_prefetch(global_drive, FALSE,
+                                 wait_disk ? vm_disk_ready : NULL, NULL);
+    if (wait_snapshot) {
+        /* restore a saved machine instead of booting:
+           vm_snapshot_done() follows */
+        snapshot_fetch(snapshot_url,
+                       block_net_get_snapshot_size(global_drive));
     }
+    vm_maybe_run();
 }
 
-static void vm_run(VirtMachine *m, BOOL restored)
+static void vm_disk_ready(void *opaque)
 {
-    if (global_drive)
-        block_net_start_prefetch(global_drive, restored);
-    emscripten_async_call(virt_machine_run, m, 0);
+    wait_disk = FALSE;
+    vm_maybe_run();
+}
+
+static void vm_maybe_run(void)
+{
+    if (wait_disk || wait_snapshot || vm_running)
+        return;
+    vm_running = TRUE;
+    vm_run_notify(vm_restored);
+    emscripten_async_call(virt_machine_run, global_vm, 0);
 }
 
 /* Snapshots, called from lib.js. A snapshot is the machine state
@@ -388,7 +416,12 @@ void vm_snapshot_done(int status)
     VirtMachine *m = global_vm;
     if (status < 0 && m->vmc->vm_reset)
         m->vmc->vm_reset(m);
-    vm_run(m, status > 0);
+    vm_restored = status > 0;
+    wait_snapshot = FALSE;
+    /* the image loads while the machine runs: let the guest go first */
+    if (global_drive && !wait_disk)
+        block_net_start_prefetch(global_drive, vm_restored, NULL, NULL);
+    vm_maybe_run();
 }
 
 /* need to be long enough to hide the non zero delay of setTimeout(_, 0) */
