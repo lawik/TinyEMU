@@ -49,6 +49,11 @@ extern void fb_refresh(void *opaque, void *data,
                        int x, int y, int w, int h, int stride);
 extern void net_recv_packet(EthernetDevice *bs,
                             const uint8_t *buf, int len);
+/* fetch the snapshot and restore it (vm_snapshot_*), then call
+   vm_snapshot_done() */
+extern void snapshot_fetch(const char *url);
+/* hand a saved snapshot (state, then the RAM) to the page */
+extern void snapshot_write(const uint8_t *state, int state_len);
 
 static uint8_t console_fifo[1024];
 static int console_fifo_windex;
@@ -60,6 +65,7 @@ static int global_width;
 static int global_height;
 static VirtMachine *global_vm;
 static BOOL global_carrier_state;
+static BlockDevice *global_drive; /* the HTTP disk, if any */
 
 static int console_read(void *opaque, uint8_t *buf, int len)
 {
@@ -179,6 +185,7 @@ typedef struct {
 static void init_vm(void *arg);
 static void init_vm_fs(void *arg);
 static void init_vm_drive(void *arg);
+static void vm_run(VirtMachine *m, BOOL restored);
 
 void vm_start(const char *url, int ram_size, const char *cmdline,
               const char *pwd, int width, int height, BOOL has_network)
@@ -236,6 +243,7 @@ static void init_vm(void *arg)
     VMStartState *s = arg;
     VirtMachine *m;
     VirtMachineParams *p = s->p;
+    const char *snapshot_url;
     int i;
     
     p->rtc_real_time = TRUE;
@@ -278,6 +286,7 @@ static void init_vm(void *arg)
 
     m = virt_machine_init(p);
     global_vm = m;
+    global_drive = p->drive_count > 0 ? p->tab_drive[0].block_dev : NULL;
 
     virt_machine_free_config(s->p);
 
@@ -292,8 +301,94 @@ static void init_vm(void *arg)
         free(s->pwd);
     }
     free(s);
-    
+
+    snapshot_url = global_drive ? block_net_get_snapshot_url(global_drive) : NULL;
+    if (snapshot_url && m->vmc->vm_load_state) {
+        /* restore a saved machine instead of booting: vm_snapshot_done()
+           starts it */
+        snapshot_fetch(snapshot_url);
+    } else {
+        vm_run(m, FALSE);
+    }
+}
+
+static void vm_run(VirtMachine *m, BOOL restored)
+{
+    if (global_drive)
+        block_net_start_prefetch(global_drive, restored);
     emscripten_async_call(virt_machine_run, m, 0);
+}
+
+/* Snapshots, called from lib.js. A snapshot is the machine state
+   (vm_snapshot_save_state) and the RAM regions (vm_snapshot_get_ram). */
+
+/* the state in a malloc'ed buffer (free it), NULL if it cannot be saved
+   now: try again a bit later */
+uint8_t *vm_snapshot_save_state(int *plen)
+{
+    VirtMachine *m = global_vm;
+    uint8_t *buf;
+    int len;
+
+    *plen = 0;
+    if (!m || !m->vmc->vm_save_state)
+        return NULL;
+    len = m->vmc->vm_save_state(m, NULL, 0);
+    if (len < 0)
+        return NULL;
+    buf = malloc(len);
+    if (m->vmc->vm_save_state(m, buf, len) != len) {
+        free(buf);
+        return NULL;
+    }
+    *plen = len;
+    return buf;
+}
+
+/* save a snapshot and give it to the page (Module.onSnapshotSaved) */
+void vm_snapshot_save(void)
+{
+    uint8_t *state;
+    int len;
+
+    state = vm_snapshot_save_state(&len);
+    snapshot_write(state, state ? len : -1);
+    free(state);
+}
+
+/* 0 if the state fits this machine (and, unless check_only, is loaded) */
+int vm_snapshot_load_state(const uint8_t *buf, int len, int check_only)
+{
+    VirtMachine *m = global_vm;
+    if (!m || !m->vmc->vm_load_state)
+        return -1;
+    return m->vmc->vm_load_state(m, buf, len, check_only);
+}
+
+/* RAM region idx (0, 1, ...): its address in the heap, NULL past the last
+   one */
+uint8_t *vm_snapshot_get_ram(int idx, int *psize)
+{
+    VirtMachine *m = global_vm;
+    uint64_t size;
+    uint8_t *ptr;
+
+    *psize = 0;
+    if (!m || !m->vmc->vm_get_ram)
+        return NULL;
+    ptr = m->vmc->vm_get_ram(m, idx, &size);
+    *psize = size;
+    return ptr;
+}
+
+/* the restore is over: 1 restored, 0 not used (the machine is untouched
+   and boots), -1 failed after the RAM was changed (cold boot) */
+void vm_snapshot_done(int status)
+{
+    VirtMachine *m = global_vm;
+    if (status < 0 && m->vmc->vm_reset)
+        m->vmc->vm_reset(m);
+    vm_run(m, status > 0);
 }
 
 /* need to be long enough to hide the non zero delay of setTimeout(_, 0) */

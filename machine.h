@@ -140,6 +140,18 @@ struct VirtMachineClass {
     void (*vm_send_mouse_event)(VirtMachine *s1, int dx, int dy, int dz,
                                 unsigned int buttons);
     void (*vm_send_key_event)(VirtMachine *s1, BOOL is_down, uint16_t key_code);
+    /* snapshots (NULL if unsupported). The state is everything but the
+       RAM, which the frontend copies itself (vm_get_ram: region 0, 1, ...
+       until NULL). save returns the size (buf NULL: just the size), -1 if
+       the machine cannot be saved now (e.g. a disk request is in
+       progress); load returns 0, or -1 if the state does not fit this
+       machine (with check_only, nothing is changed). */
+    int (*vm_save_state)(VirtMachine *s, uint8_t *buf, int buf_size);
+    int (*vm_load_state)(VirtMachine *s, const uint8_t *buf, int len,
+                         BOOL check_only);
+    uint8_t *(*vm_get_ram)(VirtMachine *s, int idx, uint64_t *psize);
+    /* power-on reset (a cold boot), e.g. after a failed restore */
+    void (*vm_reset)(VirtMachine *s);
 };
 
 extern const VirtMachineClass riscv_machine_class;
@@ -205,3 +217,5 @@ BlockDevice *block_device_init_http(const char *url,
                                     int max_cache_size_kb,
                                     void (*start_cb)(void *opaque),
                                     void *start_opaque);
+const char *block_net_get_snapshot_url(BlockDevice *bs);
+void block_net_start_prefetch(BlockDevice *bs, BOOL yield_to_guest);

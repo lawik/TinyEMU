@@ -59,6 +59,12 @@ typedef struct VIRTIODevice VIRTIODevice;
 
 void virtio_set_debug(VIRTIODevice *s, int debug_flags);
 void virtio_device_reset(VIRTIODevice *s);
+/* snapshots: save returns the size (buf NULL: just the size), -1 if the
+   device cannot be saved now; load returns 0, or -1 if the state does not
+   fit this device */
+int virtio_device_save(VIRTIODevice *s, uint8_t *buf, int buf_size);
+int virtio_device_load(VIRTIODevice *s, const uint8_t *buf, int len,
+                       BOOL check_only);
 
 /* block device */
 
@@ -75,10 +81,17 @@ struct BlockDevice {
                        uint64_t sector_num, const uint8_t *buf, int n,
                        BlockDeviceCompletionFunc *cb, void *opaque);
     void *opaque;
+    /* snapshots (NULL if unsupported): the data the guest has written.
+       save returns the size (buf NULL: just the size) or -1; load returns
+       0, or -1 if the data does not fit this device */
+    int (*save_writes)(BlockDevice *bs, uint8_t *buf, int buf_size);
+    int (*load_writes)(BlockDevice *bs, const uint8_t *buf, int len,
+                       BOOL check_only);
 };
 
 VIRTIODevice *virtio_block_init(VIRTIOBusDef *bus, BlockDevice *bs);
 BOOL virtio_block_busy(VIRTIODevice *s);
+BlockDevice *virtio_block_get_device(VIRTIODevice *s);
 
 /* network device */
 

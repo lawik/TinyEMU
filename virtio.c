@@ -32,6 +32,7 @@
 #include "cutils.h"
 #include "list.h"
 #include "virtio.h"
+#include "snapshot.h"
 
 //#define DEBUG_VIRTIO
 
@@ -191,6 +192,91 @@ void virtio_device_reset(VIRTIODevice *s)
 {
     set_irq(s->irq, 0);
     virtio_reset(s);
+}
+
+/* Snapshots: what the guest driver set up (status, interrupt status,
+   queue addresses and indexes) and the config space. The rest of the
+   queue state is in guest RAM. The interrupt line itself is part of the
+   interrupt controller's state. A block device can only be saved
+   between requests. */
+#define VIRTIO_STATE_VERSION 1
+
+int virtio_device_save(VIRTIODevice *s, uint8_t *buf, int buf_size)
+{
+    SnapWriter w1, *w = &w1;
+    int i;
+
+    if (s->device_id == 2 && virtio_block_busy(s))
+        return -1;
+    snap_writer_init(w, buf, buf_size);
+    snap_put_u32(w, VIRTIO_STATE_VERSION);
+    snap_put_u32(w, s->device_id);
+    snap_put_u32(w, s->int_status);
+    snap_put_u32(w, s->status);
+    snap_put_u32(w, s->device_features_sel);
+    snap_put_u32(w, s->queue_sel);
+    snap_put_u32(w, MAX_QUEUE);
+    for(i = 0; i < MAX_QUEUE; i++) {
+        QueueState *qs = &s->queue[i];
+        snap_put_u32(w, qs->ready);
+        snap_put_u32(w, qs->num);
+        snap_put_u32(w, qs->last_avail_idx);
+        snap_put_u64(w, qs->desc_addr);
+        snap_put_u64(w, qs->avail_addr);
+        snap_put_u64(w, qs->used_addr);
+        snap_put_u32(w, qs->manual_recv);
+    }
+    snap_put_u32(w, s->config_space_size);
+    snap_put_data(w, s->config_space, s->config_space_size);
+    return snap_writer_end(w);
+}
+
+int virtio_device_load(VIRTIODevice *s, const uint8_t *buf, int len,
+                       BOOL check_only)
+{
+    SnapReader r1, *r = &r1;
+    uint32_t int_status, status, features_sel, queue_sel, config_size;
+    QueueState queue[MAX_QUEUE];
+    const uint8_t *config;
+    int i;
+
+    snap_reader_init(r, buf, len);
+    if (snap_get_u32(r) != VIRTIO_STATE_VERSION ||
+        snap_get_u32(r) != s->device_id)
+        return -1;
+    int_status = snap_get_u32(r);
+    status = snap_get_u32(r);
+    features_sel = snap_get_u32(r);
+    queue_sel = snap_get_u32(r);
+    if (snap_get_u32(r) != MAX_QUEUE)
+        return -1;
+    for(i = 0; i < MAX_QUEUE; i++) {
+        QueueState *qs = &queue[i];
+        qs->ready = snap_get_u32(r);
+        qs->num = snap_get_u32(r);
+        qs->last_avail_idx = snap_get_u32(r);
+        qs->desc_addr = snap_get_u64(r);
+        qs->avail_addr = snap_get_u64(r);
+        qs->used_addr = snap_get_u64(r);
+        qs->manual_recv = snap_get_u32(r);
+        if (qs->num > MAX_QUEUE_NUM)
+            return -1;
+    }
+    config_size = snap_get_u32(r);
+    if (config_size != s->config_space_size)
+        return -1;
+    config = snap_get_data(r, config_size);
+    if (!snap_reader_done(r) || queue_sel >= MAX_QUEUE)
+        return -1;
+    if (check_only)
+        return 0;
+    s->int_status = int_status;
+    s->status = status;
+    s->device_features_sel = features_sel;
+    s->queue_sel = queue_sel;
+    memcpy(s->queue, queue, sizeof(queue));
+    memcpy(s->config_space, config, config_size);
+    return 0;
 }
 
 static uint8_t *virtio_pci_get_ram_ptr(VIRTIODevice *s, virtio_phys_addr_t paddr, BOOL is_rw)
@@ -1145,6 +1231,11 @@ static int virtio_block_recv_request(VIRTIODevice *s, int queue_idx,
 BOOL virtio_block_busy(VIRTIODevice *s)
 {
     return ((VIRTIOBlockDevice *)s)->req_in_progress;
+}
+
+BlockDevice *virtio_block_get_device(VIRTIODevice *s)
+{
+    return ((VIRTIOBlockDevice *)s)->bs;
 }
 
 VIRTIODevice *virtio_block_init(VIRTIOBusDef *bus, BlockDevice *bs)

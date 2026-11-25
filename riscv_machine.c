@@ -37,6 +37,7 @@
 #include "riscv_cpu.h"
 #include "virtio.h"
 #include "machine.h"
+#include "snapshot.h"
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
@@ -1202,6 +1203,174 @@ static BOOL riscv_machine_reset_ready(RISCVMachine *s)
     return TRUE;
 }
 
+/* Snapshots. The state: the timer (as the current mtime, so that guest
+   time continues from where it was saved), the CLINT, PLIC and HTIF
+   registers, the CPU, each virtio device in order and the data written to
+   each disk. The RAM is not included: see riscv_machine_get_ram(). */
+#define RISCV_STATE_MAGIC 0x54535652 /* "RVST" */
+#define RISCV_STATE_VERSION 1
+
+static int riscv_machine_save_state(VirtMachine *s1, uint8_t *buf,
+                                    int buf_size)
+{
+    RISCVMachine *s = (RISCVMachine *)s1;
+    SnapWriter w1, *w = &w1;
+    BlockDevice *bs;
+    int i, len;
+    uint8_t *p;
+
+    if (s->halted || s->reset_pending || !riscv_machine_reset_ready(s))
+        return -1;
+    snap_writer_init(w, buf, buf_size);
+    snap_put_u32(w, RISCV_STATE_MAGIC);
+    snap_put_u32(w, RISCV_STATE_VERSION);
+    snap_put_u32(w, s->max_xlen);
+    snap_put_u64(w, s->ram_size);
+    snap_put_u32(w, LOW_RAM_SIZE);
+
+    snap_put_u64(w, rtc_get_time(s));
+    snap_put_u64(w, s->timecmp);
+    snap_put_u32(w, s->plic_pending_irq);
+    snap_put_u32(w, s->plic_served_irq);
+    snap_put_u64(w, s->htif_tohost);
+    snap_put_u64(w, s->htif_fromhost);
+    snap_put_u32(w, s->htif_kbd_wanted);
+
+    len = riscv_cpu_save_state(s->cpu_state, NULL, 0);
+    snap_put_u32(w, len);
+    p = snap_reserve(w, len);
+    if (p)
+        riscv_cpu_save_state(s->cpu_state, p, len);
+
+    snap_put_u32(w, s->virtio_count);
+    for(i = 0; i < s->virtio_count; i++) {
+        len = virtio_device_save(s->virtio_devs[i], NULL, 0);
+        if (len < 0)
+            return -1;
+        snap_put_u32(w, len);
+        p = snap_reserve(w, len);
+        if (p)
+            virtio_device_save(s->virtio_devs[i], p, len);
+    }
+
+    snap_put_u32(w, s->blk_count);
+    for(i = 0; i < s->blk_count; i++) {
+        bs = virtio_block_get_device(s->blk_devs[i]);
+        if (!bs->save_writes)
+            return -1;
+        len = bs->save_writes(bs, NULL, 0);
+        if (len < 0)
+            return -1;
+        snap_put_u32(w, len);
+        p = snap_reserve(w, len);
+        if (p)
+            bs->save_writes(bs, p, len);
+    }
+    return snap_writer_end(w);
+}
+
+/* two passes: the first one checks everything, the second one (unless
+   check_only) applies it, so a state that does not fit changes nothing */
+static int riscv_machine_load_state(VirtMachine *s1, const uint8_t *buf,
+                                    int len, BOOL check_only)
+{
+    RISCVMachine *s = (RISCVMachine *)s1;
+    SnapReader r1, *r = &r1;
+    uint64_t mtime, timecmp, tohost, fromhost;
+    uint32_t pending, served, kbd_wanted;
+    BlockDevice *bs;
+    const uint8_t *p;
+    int i, n, pass, l;
+
+    for(pass = 0; pass < 2; pass++) {
+        BOOL apply = (pass == 1);
+        snap_reader_init(r, buf, len);
+        if (snap_get_u32(r) != RISCV_STATE_MAGIC ||
+            snap_get_u32(r) != RISCV_STATE_VERSION ||
+            snap_get_u32(r) != s->max_xlen ||
+            snap_get_u64(r) != s->ram_size ||
+            snap_get_u32(r) != LOW_RAM_SIZE)
+            return -1;
+        mtime = snap_get_u64(r);
+        timecmp = snap_get_u64(r);
+        pending = snap_get_u32(r);
+        served = snap_get_u32(r);
+        tohost = snap_get_u64(r);
+        fromhost = snap_get_u64(r);
+        kbd_wanted = snap_get_u32(r);
+
+        l = snap_get_u32(r);
+        p = snap_get_data(r, l);
+        if (!p || riscv_cpu_load_state(s->cpu_state, p, l, !apply) < 0)
+            return -1;
+
+        n = snap_get_u32(r);
+        if (n != s->virtio_count)
+            return -1;
+        for(i = 0; i < n; i++) {
+            l = snap_get_u32(r);
+            p = snap_get_data(r, l);
+            if (!p || virtio_device_load(s->virtio_devs[i], p, l, !apply) < 0)
+                return -1;
+        }
+
+        n = snap_get_u32(r);
+        if (n != s->blk_count)
+            return -1;
+        for(i = 0; i < n; i++) {
+            bs = virtio_block_get_device(s->blk_devs[i]);
+            l = snap_get_u32(r);
+            p = snap_get_data(r, l);
+            if (!p || !bs->load_writes || bs->load_writes(bs, p, l, !apply) < 0)
+                return -1;
+        }
+        if (!snap_reader_done(r))
+            return -1;
+
+        if (apply) {
+            /* the interrupt controller last: it is the source of truth
+               for the interrupt lines of the devices */
+            if (s->rtc_real_time)
+                s->rtc_start_time = rtc_get_real_time(s) - mtime;
+            s->timecmp = timecmp;
+            s->plic_pending_irq = pending;
+            s->plic_served_irq = served;
+            s->htif_tohost = tohost;
+            s->htif_fromhost = fromhost;
+            s->htif_kbd_wanted = kbd_wanted;
+            s->reset_pending = FALSE;
+            s->halted = FALSE;
+        } else if (check_only) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/* the RAM regions, in a fixed order: the main RAM, then the low RAM (boot
+   ROM and device tree) */
+static uint8_t *riscv_machine_get_ram(VirtMachine *s1, int idx,
+                                      uint64_t *psize)
+{
+    RISCVMachine *s = (RISCVMachine *)s1;
+    switch(idx) {
+    case 0:
+        *psize = s->ram_size;
+        return get_ram_ptr(s, RAM_BASE_ADDR, TRUE);
+    case 1:
+        *psize = LOW_RAM_SIZE;
+        return get_ram_ptr(s, 0, TRUE);
+    default:
+        *psize = 0;
+        return NULL;
+    }
+}
+
+static void riscv_machine_vm_reset(VirtMachine *s1)
+{
+    riscv_machine_reset((RISCVMachine *)s1);
+}
+
 static void riscv_machine_end(VirtMachine *s1)
 {
     RISCVMachine *s = (RISCVMachine *)s1;
@@ -1290,4 +1459,8 @@ const VirtMachineClass riscv_machine_class = {
     riscv_vm_mouse_is_absolute,
     riscv_vm_send_mouse_event,
     riscv_vm_send_key_event,
+    riscv_machine_save_state,
+    riscv_machine_load_state,
+    riscv_machine_get_ram,
+    riscv_machine_vm_reset,
 };

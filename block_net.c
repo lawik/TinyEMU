@@ -38,6 +38,10 @@
 #include "list.h"
 #include "fbuf.h"
 #include "machine.h"
+#include "snapshot.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 typedef enum {
     CBLOCK_LOADING,
@@ -115,10 +119,34 @@ typedef struct BlockDeviceHTTP {
     int *prefetch_queue;
     int prefetch_len, prefetch_pos;
     int prefetch_parallel, prefetch_in_flight;
+
+    /* snapshot: "snapshot" in blk.txt names a saved machine to restore
+       instead of booting (relative to blk.txt). The background loads then
+       wait until the frontend has restored it (or decided not to), so the
+       two downloads do not compete. */
+    char snapshot_url[1100];
+    BOOL prefetch_started;
+    /* after a restore the guest needs few blocks, but needs them now: the
+       background loads then yield to it (block_net_start_prefetch()) */
+    BOOL yield_to_guest;
+    int64_t guest_wait_ms; /* last time a guest request waited for a block */
+    BOOL pump_timer;
+    /* the clusters came from a snapshot and are not persisted yet: they
+       are, with the first write of the guest (until then the disk is the
+       pristine image plus the snapshot, and the next visit can restore the
+       snapshot again) */
+    BOOL persist_on_write;
 } BlockDeviceHTTP;
 
 static void bf_update_block(CachedBlock *b, const uint8_t *data);
 static void bf_init_done(BlockDeviceHTTP *bf);
+static void bf_prefetch_pump(BlockDeviceHTTP *bf);
+static int bf_save_writes(BlockDevice *bs, uint8_t *buf, int buf_size);
+#ifdef __EMSCRIPTEN__
+static void bf_persist_all_clusters(BlockDeviceHTTP *bf);
+#endif
+static int bf_load_writes(BlockDevice *bs, const uint8_t *buf, int len,
+                          BOOL check_only);
 #ifdef __EMSCRIPTEN__
 /* provided in lib.js: keep written clusters in the browser (IndexedDB) so
    that they survive a page reload */
@@ -220,6 +248,24 @@ static CachedBlock *bf_start_load_block(BlockDevice *bs, int block_num)
 
 static BOOL bf_block_is_zero(BlockDeviceHTTP *bf, int block_num);
 
+#define YIELD_MS 300 /* quiet time after a guest wait before loading more */
+
+static int64_t bf_time_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+#ifdef __EMSCRIPTEN__
+static void bf_prefetch_pump_timer(void *opaque)
+{
+    BlockDeviceHTTP *bf = opaque;
+    bf->pump_timer = FALSE;
+    bf_prefetch_pump(bf);
+}
+#endif
+
 /* start background loads until prefetch_parallel are in flight. Blocks
    that are cached or loading already (because the guest asked for them)
    are skipped, and nothing is evicted from the cache to make room. */
@@ -227,6 +273,26 @@ static void bf_prefetch_pump(BlockDeviceHTTP *bf)
 {
     CachedBlock *b;
     int block_num;
+
+    if (!bf->prefetch_started)
+        return;
+#ifdef __EMSCRIPTEN__
+    if (bf->yield_to_guest) {
+        int64_t quiet;
+        /* the guest waits for a block: its load restarts the pump */
+        if (bf->cur_block_num >= 0)
+            return;
+        quiet = bf_time_ms() - bf->guest_wait_ms;
+        if (quiet < YIELD_MS) {
+            if (!bf->pump_timer) {
+                bf->pump_timer = TRUE;
+                emscripten_async_call(bf_prefetch_pump_timer, bf,
+                                      YIELD_MS - quiet);
+            }
+            return;
+        }
+    }
+#endif
 
     while (bf->prefetch_in_flight < bf->prefetch_parallel &&
            bf->prefetch_pos < bf->prefetch_len &&
@@ -328,6 +394,8 @@ static int bf_rw_async1(BlockDevice *bs, BOOL is_sync)
                 file_buffer_write(&c->fbuf, offset * 512,
                                   bf->io_buf + bf->sector_index * 512, n * 512);
 #ifdef __EMSCRIPTEN__
+                if (bf->persist_on_write)
+                    bf_persist_all_clusters(bf);
                 block_persist_dirty(cluster_num, c->fbuf.handle);
 #endif
             } else {
@@ -371,6 +439,7 @@ static int bf_rw_async1(BlockDevice *bs, BOOL is_sync)
             if (b) {
                 if (b->state == CBLOCK_LOADING) {
                     /* wait until the block is loaded */
+                    bf->guest_wait_ms = bf_time_ms();
                     return 1;
                 } else {
                     if (bf->is_write) {
@@ -400,6 +469,7 @@ static int bf_rw_async1(BlockDevice *bs, BOOL is_sync)
                     bf->sector_num += n;
                 }
             } else {
+                bf->guest_wait_ms = bf_time_ms();
                 bf_start_load_block(bs, block_num);
                 return 1;
             }
@@ -519,6 +589,8 @@ BlockDevice *block_device_init_http(const char *url,
     bs->get_sector_count = bf_get_sector_count;
     bs->read_async = bf_read_async;
     bs->write_async = bf_write_async;
+    bs->save_writes = bf_save_writes;
+    bs->load_writes = bf_load_writes;
     
     fs_wget(url, NULL, NULL, bs, bf_init_onload, TRUE);
     return bs;
@@ -668,6 +740,13 @@ static void bf_init_onload(void *opaque, int err, void *data, size_t size)
             snprintf(bf->disk_id, sizeof(bf->disk_id), "%sblk.txt", bf->url);
         }
     }
+    {
+        JSONValue snap = json_object_get(cfg, "snapshot");
+        if (snap.type == JSON_STR) {
+            snprintf(bf->snapshot_url, sizeof(bf->snapshot_url), "%s%s",
+                     bf->url, snap.u.str->data);
+        }
+    }
     json_free(cfg);
 
 #ifdef __EMSCRIPTEN__
@@ -680,8 +759,12 @@ static void bf_init_onload(void *opaque, int err, void *data, size_t size)
     }
 #endif
     /* start the background loads: they run while the persisted clusters
-       are restored and the machine boots */
-    bf_prefetch_pump(bf);
+       are restored and the machine boots (with a snapshot, once the
+       frontend calls block_net_start_prefetch()) */
+    if (!bf->snapshot_url[0]) {
+        bf->prefetch_started = TRUE;
+        bf_prefetch_pump(bf);
+    }
 
 #ifdef __EMSCRIPTEN__
     /* restore the clusters written in earlier sessions, then start */
@@ -725,3 +808,115 @@ void block_persist_ready(BlockDeviceHTTP *bf)
 {
     bf_init_done(bf);
 }
+
+/* Snapshots */
+
+/* the snapshot to restore instead of booting, if blk.txt names one and no
+   persisted writes were restored (they would not match the snapshot's
+   memory); NULL otherwise */
+const char *block_net_get_snapshot_url(BlockDevice *bs)
+{
+    BlockDeviceHTTP *bf = bs->opaque;
+    if (!bf->snapshot_url[0] || bf->n_allocated_clusters != 0)
+        return NULL;
+    return bf->snapshot_url;
+}
+
+/* start the background loads; with yield_to_guest (after a restore) at
+   most two at a time, and none starts while a guest request waits for a
+   block or within YIELD_MS of one */
+void block_net_start_prefetch(BlockDevice *bs, BOOL yield_to_guest)
+{
+    BlockDeviceHTTP *bf = bs->opaque;
+    if (yield_to_guest) {
+        bf->yield_to_guest = TRUE;
+        bf->prefetch_parallel = min_int(bf->prefetch_parallel, 2);
+    }
+    if (!bf->prefetch_started) {
+        bf->prefetch_started = TRUE;
+        bf_prefetch_pump(bf);
+    }
+}
+
+#ifdef __EMSCRIPTEN__
+static void bf_persist_all_clusters(BlockDeviceHTTP *bf)
+{
+    int i;
+    bf->persist_on_write = FALSE;
+    for(i = 0; i < bf->n_clusters; i++) {
+        if (bf->clusters[i])
+            block_persist_dirty(i, bf->clusters[i]->fbuf.handle);
+    }
+}
+#endif
+
+/* the written clusters: cluster size, count, then (number, data) */
+static int bf_save_writes(BlockDevice *bs, uint8_t *buf, int buf_size)
+{
+    BlockDeviceHTTP *bf = bs->opaque;
+    SnapWriter w1, *w = &w1;
+    int i, n, cluster_size;
+    uint8_t *p;
+
+    /* the virtio device refuses to save while a request is in progress */
+    cluster_size = bf->sectors_per_cluster * 512;
+    n = 0;
+    for(i = 0; i < bf->n_clusters; i++) {
+        if (bf->clusters[i])
+            n++;
+    }
+    snap_writer_init(w, buf, buf_size);
+    snap_put_u32(w, cluster_size);
+    snap_put_u32(w, n);
+    for(i = 0; i < bf->n_clusters; i++) {
+        if (bf->clusters[i]) {
+            snap_put_u32(w, i);
+            p = snap_reserve(w, cluster_size);
+            if (p)
+                file_buffer_read(&bf->clusters[i]->fbuf, 0, p, cluster_size);
+        }
+    }
+    return snap_writer_end(w);
+}
+
+static int bf_load_writes(BlockDevice *bs, const uint8_t *buf, int len,
+                          BOOL check_only)
+{
+    BlockDeviceHTTP *bf = bs->opaque;
+    SnapReader r1, *r = &r1;
+    int i, n, num, cluster_size;
+    const uint8_t *data;
+    Cluster *c;
+
+    cluster_size = bf->sectors_per_cluster * 512;
+    /* only on top of the pristine image */
+    if (bf->n_allocated_clusters != 0)
+        return -1;
+    snap_reader_init(r, buf, len);
+    if (snap_get_u32(r) != cluster_size)
+        return -1;
+    n = snap_get_u32(r);
+    for(i = 0; i < n; i++) {
+        num = snap_get_u32(r);
+        data = snap_get_data(r, cluster_size);
+        if (r->error || num < 0 || num >= bf->n_clusters)
+            return -1;
+        if (check_only)
+            continue;
+        c = bf->clusters[num];
+        if (!c) {
+            c = mallocz(sizeof(Cluster));
+            file_buffer_init(&c->fbuf);
+            file_buffer_resize(&c->fbuf, cluster_size);
+            bf->clusters[num] = c;
+            bf->n_allocated_clusters++;
+        }
+        file_buffer_write(&c->fbuf, 0, data, cluster_size);
+    }
+    if (!snap_reader_done(r))
+        return -1;
+    if (!check_only && n > 0)
+        bf->persist_on_write = TRUE;
+    return 0;
+}
+

@@ -56,6 +56,11 @@ typedef struct {
     uint32_t (*riscv_cpu_get_misa)(RISCVCPUState *s);
     void (*riscv_cpu_flush_tlb_write_range_ram)(RISCVCPUState *s,
                                                 uint8_t *ram_ptr, size_t ram_size);
+    /* snapshots: save returns the size (buf NULL: just the size), -1 on
+       error; load returns 0, or -1 if the state does not fit this CPU */
+    int (*riscv_cpu_save_state)(RISCVCPUState *s, uint8_t *buf, int buf_size);
+    int (*riscv_cpu_load_state)(RISCVCPUState *s, const uint8_t *buf, int len,
+                                BOOL check_only);
 } RISCVCPUClass;
 
 typedef struct {
@@ -122,6 +127,18 @@ static inline void riscv_cpu_flush_tlb_write_range_ram(RISCVCPUState *s,
 {
     const RISCVCPUClass *c = ((RISCVCPUCommonState *)s)->class_ptr;
     c->riscv_cpu_flush_tlb_write_range_ram(s, ram_ptr, ram_size);
+}
+static inline int riscv_cpu_save_state(RISCVCPUState *s, uint8_t *buf,
+                                       int buf_size)
+{
+    const RISCVCPUClass *c = ((RISCVCPUCommonState *)s)->class_ptr;
+    return c->riscv_cpu_save_state(s, buf, buf_size);
+}
+static inline int riscv_cpu_load_state(RISCVCPUState *s, const uint8_t *buf,
+                                       int len, BOOL check_only)
+{
+    const RISCVCPUClass *c = ((RISCVCPUCommonState *)s)->class_ptr;
+    return c->riscv_cpu_load_state(s, buf, len, check_only);
 }
 
 #endif /* RISCV_CPU_H */

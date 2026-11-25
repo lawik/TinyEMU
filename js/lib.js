@@ -34,7 +34,16 @@
    onDownloading(flag)     true while any request is outstanding
    onNetPacket(bytes)      an Ethernet frame sent by the guest
    onReset()               the guest rebooted the machine (riscv_machine.c)
-   onPowerOff(status)      the guest powered the machine off */
+   onPowerOff(status)      the guest powered the machine off
+   onSnapshot(info)        restoring a snapshot instead of booting (when
+                           blk.txt names one and no disk writes are saved):
+                           {url, phase: "start"|"progress"|"restored"|
+                            "skipped"|"error", loaded, total, extra, message}
+   snapshot                false: never restore a snapshot
+   onSnapshotSaved(bytes)  the result of ccall("vm_snapshot_save"): the
+                           snapshot file, or null if the machine is busy
+                           (try again); snapshotExtra (a Uint8Array) is
+                           stored in it and given back as info.extra */
 mergeInto(LibraryManager.library, {
     $WgetState: {
         nextHandle: 1,
@@ -504,4 +513,243 @@ mergeInto(LibraryManager.library, {
       }
   },
    
+
+  /* Snapshots: a saved machine that the page can restore instead of
+     booting. The file (gzip-compressed when served):
+       "TEMUSNAP", u32 version (1)
+       u32 length, machine state (vm_snapshot_save_state)
+       u32 length, extra data for the page (Module.snapshotExtra when
+         saved, e.g. the console output so far)
+       u32 region count, then per RAM region: u32 size, u32 page size,
+         a bitmap of the pages that are not all zeros, those pages
+     All numbers little-endian. Module.onSnapshot(info) follows a restore:
+     phase "start", "progress" (loaded, total: bytes downloaded),
+     "restored" (extra), "skipped" or "error" (message; the machine boots
+     instead). Module.snapshot = false skips it. */
+  snapshot_write: function(state, state_len)
+  {
+      var cb = Module.onSnapshotSaved, PAGE = 4096;
+      var extra, regions = [], idx, ptr, size, sizep, total, r, i, j, n;
+      var out, dv, pos, base, nonzero;
+      if (state_len < 0) {
+          if (cb)
+              cb(null);
+          return;
+      }
+      extra = Module.snapshotExtra || new Uint8Array(0);
+      sizep = _malloc(4);
+      for(idx = 0; ; idx++) {
+          ptr = _vm_snapshot_get_ram(idx, sizep);
+          if (!ptr)
+              break;
+          regions.push({ ptr: ptr, size: HEAP32[sizep >> 2] });
+      }
+      _free(sizep);
+      total = 8 + 4 + 4 + state_len + 4 + extra.length + 4;
+      for(idx = 0; idx < regions.length; idx++) {
+          r = regions[idx];
+          n = r.size / PAGE;
+          r.bitmap = new Uint8Array((n + 7) >> 3);
+          r.count = 0;
+          for(i = 0; i < n; i++) {
+              base = (r.ptr + i * PAGE) >> 2;
+              nonzero = false;
+              for(j = 0; j < PAGE / 4; j++) {
+                  if (HEAP32[base + j] != 0) {
+                      nonzero = true;
+                      break;
+                  }
+              }
+              if (nonzero) {
+                  r.bitmap[i >> 3] |= 1 << (i & 7);
+                  r.count++;
+              }
+          }
+          total += 8 + r.bitmap.length + r.count * PAGE;
+      }
+      out = new Uint8Array(total);
+      dv = new DataView(out.buffer);
+      pos = 0;
+      for(i = 0; i < 8; i++)
+          out[pos++] = "TEMUSNAP".charCodeAt(i);
+      dv.setUint32(pos, 1, true); pos += 4;
+      dv.setUint32(pos, state_len, true); pos += 4;
+      out.set(HEAPU8.subarray(state, state + state_len), pos); pos += state_len;
+      dv.setUint32(pos, extra.length, true); pos += 4;
+      out.set(extra, pos); pos += extra.length;
+      dv.setUint32(pos, regions.length, true); pos += 4;
+      for(idx = 0; idx < regions.length; idx++) {
+          r = regions[idx];
+          dv.setUint32(pos, r.size, true); pos += 4;
+          dv.setUint32(pos, PAGE, true); pos += 4;
+          out.set(r.bitmap, pos); pos += r.bitmap.length;
+          n = r.size / PAGE;
+          for(i = 0; i < n; i++) {
+              if (r.bitmap[i >> 3] & (1 << (i & 7))) {
+                  out.set(HEAPU8.subarray(r.ptr + i * PAGE, r.ptr + (i + 1) * PAGE), pos);
+                  pos += PAGE;
+              }
+          }
+      }
+      if (cb)
+          cb(out, { regions: regions.map(function(r) {
+              return { size: r.size, pages: r.count };
+          }) });
+  },
+
+  snapshot_fetch: function(url_ptr)
+  {
+      var url = UTF8ToString(url_ptr);
+      var touched = false, state_ptr = 0, loaded = 0, total = 0;
+
+      function report(info)
+      {
+          info.url = url;
+          if (Module.onSnapshot)
+              Module.onSnapshot(info);
+      }
+
+      /* read exactly n bytes at a time from a stream of Uint8Arrays */
+      function ByteReader(reader)
+      {
+          var chunk = null, off = 0;
+          this.read = async function(n) {
+              var out = null, pos = 0, avail, l, v, res;
+              while (pos < n) {
+                  if (!chunk || off >= chunk.length) {
+                      res = await reader.read();
+                      if (res.done)
+                          throw new Error("the snapshot is truncated");
+                      chunk = res.value;
+                      off = 0;
+                  }
+                  avail = chunk.length - off;
+                  if (pos == 0 && avail >= n) {
+                      v = chunk.subarray(off, off + n);
+                      off += n;
+                      return v;
+                  }
+                  if (!out)
+                      out = new Uint8Array(n);
+                  l = Math.min(avail, n - pos);
+                  out.set(chunk.subarray(off, off + l), pos);
+                  off += l;
+                  pos += l;
+              }
+              return out;
+          };
+          this.u32 = async function() {
+              var b = await this.read(4);
+              return (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) >>> 0;
+          };
+      }
+
+      async function restore()
+      {
+          var resp, body, body_reader, first, gz, stream, r, b, i, n, state, extra;
+          var n_regions, idx, size, page, bitmap, ptr, sizep, actual, last = 0;
+
+          resp = await fetch(url);
+          if (!resp.ok)
+              throw new Error("HTTP " + resp.status);
+          total = +(resp.headers.get("Content-Length") || 0);
+          body = resp.body.pipeThrough(new TransformStream({
+              transform: function(chunk, ctl) {
+                  var now = performance.now();
+                  loaded += chunk.length;
+                  if (now - last >= 100) {
+                      last = now;
+                      report({ phase: "progress", loaded: loaded, total: total });
+                  }
+                  ctl.enqueue(chunk);
+              }
+          }));
+          /* gzip, unless the server already decoded it
+             (Content-Encoding) */
+          body_reader = body.getReader();
+          first = await body_reader.read();
+          if (first.done)
+              throw new Error("the snapshot is empty");
+          gz = first.value.length >= 2 && first.value[0] == 0x1f &&
+              first.value[1] == 0x8b;
+          stream = new ReadableStream({
+              start: function(ctl) { ctl.enqueue(first.value); },
+              pull: async function(ctl) {
+                  var res = await body_reader.read();
+                  if (res.done)
+                      ctl.close();
+                  else
+                      ctl.enqueue(res.value);
+              }
+          });
+          if (gz)
+              stream = stream.pipeThrough(new DecompressionStream("gzip"));
+          r = new ByteReader(stream.getReader());
+
+          b = await r.read(12);
+          for(i = 0; i < 8; i++) {
+              if (b[i] != "TEMUSNAP".charCodeAt(i))
+                  throw new Error("not a snapshot");
+          }
+          if ((b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24)) != 1)
+              throw new Error("unsupported snapshot version");
+          n = await r.u32();
+          state = await r.read(n);
+          state_ptr = _malloc(n);
+          HEAPU8.set(state, state_ptr);
+          if (_vm_snapshot_load_state(state_ptr, n, 1) != 0)
+              throw new Error("the snapshot does not fit this machine");
+          n = await r.u32();
+          extra = (await r.read(n)).slice(0);
+
+          n_regions = await r.u32();
+          sizep = _malloc(4);
+          for(idx = 0; idx < n_regions; idx++) {
+              size = await r.u32();
+              page = await r.u32();
+              ptr = _vm_snapshot_get_ram(idx, sizep);
+              actual = HEAP32[sizep >> 2];
+              if (!ptr || size != actual || page != 4096 || size % page) {
+                  _free(sizep);
+                  throw new Error("the snapshot's memory does not fit this machine");
+              }
+              bitmap = (await r.read((size / page + 7) >> 3)).slice(0);
+              touched = true;
+              HEAPU8.fill(0, ptr, ptr + size);
+              n = size / page;
+              for(i = 0; i < n; i++) {
+                  if (bitmap[i >> 3] & (1 << (i & 7)))
+                      HEAPU8.set(await r.read(page), ptr + i * page);
+              }
+          }
+          _free(sizep);
+          if (_vm_snapshot_load_state(state_ptr, state.length, 0) != 0)
+              throw new Error("the snapshot could not be loaded");
+          _free(state_ptr);
+          state_ptr = 0;
+          return extra;
+      }
+
+      if (Module.snapshot === false || typeof fetch == "undefined" ||
+          typeof DecompressionStream == "undefined" ||
+          typeof TransformStream == "undefined") {
+          report({ phase: "skipped",
+                   message: Module.snapshot === false ? "disabled" :
+                   "this browser cannot decompress it" });
+          _vm_snapshot_done(0);
+          return;
+      }
+      report({ phase: "start" });
+      restore().then(function(extra) {
+          report({ phase: "restored", loaded: loaded, total: total,
+                   extra: extra });
+          _vm_snapshot_done(1);
+      }, function(e) {
+          if (state_ptr)
+              _free(state_ptr);
+          console.log("snapshot: " + (e && e.message ? e.message : e));
+          report({ phase: "error", message: String(e && e.message ? e.message : e) });
+          _vm_snapshot_done(touched ? -1 : 0);
+      });
+  },
 });

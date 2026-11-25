@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  */
 #include <stdlib.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -1450,6 +1451,69 @@ static uint32_t glue(riscv_cpu_get_misa, MAX_XLEN)(RISCVCPUState *s)
     return s->misa;
 }
 
+/* Snapshots: the architectural state is everything from 'pc' to
+   'load_res' (registers, CSRs, counters); it holds no pointers except the
+   cached code pointers, which are recomputed, and the TLB is rebuilt.
+   The layout is that of this build, so the header records enough of it
+   (XLEN, FLEN, size, a few offsets) to refuse a state saved by a build
+   with a different one. */
+#define CPU_STATE_START offsetof(RISCVCPUState, pc)
+#define CPU_STATE_END offsetof(RISCVCPUState, mem_map)
+#define CPU_STATE_HDR_LEN (6 * 4)
+
+static void glue(riscv_cpu_state_header, MAX_XLEN)(uint32_t *h)
+{
+    h[0] = MAX_XLEN;
+    h[1] = FLEN;
+    h[2] = CPU_STATE_END - CPU_STATE_START;
+    h[3] = offsetof(RISCVCPUState, mstatus) - CPU_STATE_START;
+    h[4] = offsetof(RISCVCPUState, satp) - CPU_STATE_START;
+    h[5] = offsetof(RISCVCPUState, load_res) - CPU_STATE_START;
+}
+
+static int glue(riscv_cpu_save_state, MAX_XLEN)(RISCVCPUState *s,
+                                               uint8_t *buf, int buf_size)
+{
+    uint32_t h[6];
+    int i, len;
+
+    glue(riscv_cpu_state_header, MAX_XLEN)(h);
+    len = CPU_STATE_HDR_LEN + h[2];
+    if (buf) {
+        if (buf_size < len)
+            return -1;
+        for(i = 0; i < 6; i++)
+            put_le32(buf + 4 * i, h[i]);
+        memcpy(buf + CPU_STATE_HDR_LEN, (uint8_t *)s + CPU_STATE_START, h[2]);
+    }
+    return len;
+}
+
+static int glue(riscv_cpu_load_state, MAX_XLEN)(RISCVCPUState *s,
+                                               const uint8_t *buf, int len,
+                                               BOOL check_only)
+{
+    uint32_t h[6];
+    int i;
+
+    glue(riscv_cpu_state_header, MAX_XLEN)(h);
+    if (len != CPU_STATE_HDR_LEN + h[2])
+        return -1;
+    for(i = 0; i < 6; i++) {
+        if (get_le32(buf + 4 * i) != h[i])
+            return -1;
+    }
+    if (check_only)
+        return 0;
+    memcpy((uint8_t *)s + CPU_STATE_START, buf + CPU_STATE_HDR_LEN, h[2]);
+#ifdef USE_GLOBAL_VARIABLES
+    s->__code_ptr = NULL;
+    s->__code_end = NULL;
+#endif
+    tlb_flush_all(s);
+    return 0;
+}
+
 const RISCVCPUClass glue(riscv_cpu_class, MAX_XLEN) = {
     glue(riscv_cpu_init, MAX_XLEN),
     glue(riscv_cpu_end, MAX_XLEN),
@@ -1462,6 +1526,8 @@ const RISCVCPUClass glue(riscv_cpu_class, MAX_XLEN) = {
     glue(riscv_cpu_get_power_down, MAX_XLEN),
     glue(riscv_cpu_get_misa, MAX_XLEN),
     glue(riscv_cpu_flush_tlb_write_range_ram, MAX_XLEN),
+    glue(riscv_cpu_save_state, MAX_XLEN),
+    glue(riscv_cpu_load_state, MAX_XLEN),
 };
 
 #if CONFIG_RISCV_MAX_XLEN == MAX_XLEN
