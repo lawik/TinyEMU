@@ -60,6 +60,10 @@ extern void vm_wait_notify(int disk, int snapshot);
 extern void vm_run_notify(int restored);
 /* hand a saved snapshot (state, then the RAM) to the page */
 extern void snapshot_write(const uint8_t *state, int state_len);
+/* GPIO lines and I2C devices, in the page */
+extern void gpio_line_changed(int line, const char *name, int direction,
+                              int value, int input);
+extern int i2c_transfer(int address, int is_read, uint8_t *buf, int len);
 
 static uint8_t console_fifo[1024];
 static int console_fifo_windex;
@@ -249,6 +253,28 @@ static void init_vm_drive(void *arg)
     }
 }
 
+static void js_gpio_line_changed(void *opaque, int line, const char *name,
+                                 int direction, int value, int input)
+{
+    gpio_line_changed(line, name, direction, value, input);
+}
+
+static int js_i2c_transfer(void *opaque, int address, BOOL is_read,
+                           uint8_t *buf, int len)
+{
+    return i2c_transfer(address, is_read, buf, len);
+}
+
+static GPIOHost js_gpio_host = { NULL, js_gpio_line_changed };
+static I2CHost js_i2c_host = { NULL, js_i2c_transfer };
+
+/* the page drives a GPIO input (a button) */
+void gpio_set_input(int line, int level)
+{
+    if (global_vm && global_vm->gpio_dev)
+        virtio_gpio_set_input(global_vm->gpio_dev, line, level);
+}
+
 static void init_vm(void *arg)
 {
     VMStartState *s = arg;
@@ -295,6 +321,8 @@ static void init_vm(void *arg)
         p->tab_eth[0].net = net;
     }
 
+    p->gpio_host = &js_gpio_host;
+    p->i2c_host = &js_i2c_host;
     m = virt_machine_init(p);
     global_vm = m;
     global_drive = p->drive_count > 0 ? p->tab_drive[0].block_dev : NULL;

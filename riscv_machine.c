@@ -1143,6 +1143,23 @@ static VirtMachine *riscv_machine_init(const VirtMachineParams *p)
     vbus->addr += VIRTIO_SIZE;
     irq_num++;
 
+    /* GPIO controller and I2C adapter, after the rest for the same reason */
+    if (p->gpio_count > 0) {
+        vbus->irq = &s->plic_irq[irq_num];
+        s->common.gpio_dev = virtio_gpio_init(vbus, p->gpio_host,
+                                              (char **)p->gpio_names,
+                                              p->gpio_count);
+        s->virtio_devs[s->virtio_count++] = s->common.gpio_dev;
+        vbus->addr += VIRTIO_SIZE;
+        irq_num++;
+    }
+    if (p->i2c_enable) {
+        vbus->irq = &s->plic_irq[irq_num];
+        s->virtio_devs[s->virtio_count++] = virtio_i2c_init(vbus, p->i2c_host);
+        vbus->addr += VIRTIO_SIZE;
+        irq_num++;
+    }
+
     if (!p->files[VM_FILE_BIOS].buf) {
         vm_error("No bios found");
     }

@@ -159,6 +159,13 @@ struct VIRTIODevice {
                                               is written */
     uint32_t config_space_size; /* in bytes, must be multiple of 4 */
     uint8_t config_space[MAX_CONFIG_SPACE_SIZE];
+    /* optional, for state of its own: device_reset() follows a reset by
+       the driver or of the machine; device_save() adds to a snapshot and
+       device_load() reads it back (checks it, and applies it unless
+       check_only; -1 if it does not fit) */
+    void (*device_reset)(VIRTIODevice *s);
+    void (*device_save)(VIRTIODevice *s, SnapWriter *w);
+    int (*device_load)(VIRTIODevice *s, SnapReader *r, BOOL check_only);
 };
 
 static uint32_t virtio_mmio_read(void *opaque, uint32_t offset1, int size_log2);
@@ -185,6 +192,8 @@ static void virtio_reset(VIRTIODevice *s)
         qs->used_addr = 0;
         qs->last_avail_idx = 0;
     }
+    if (s->device_reset)
+        s->device_reset(s);
 }
 
 /* machine reset: as if the driver had written 0 to the status register */
@@ -228,13 +237,15 @@ int virtio_device_save(VIRTIODevice *s, uint8_t *buf, int buf_size)
     }
     snap_put_u32(w, s->config_space_size);
     snap_put_data(w, s->config_space, s->config_space_size);
+    if (s->device_save)
+        s->device_save(s, w);
     return snap_writer_end(w);
 }
 
 int virtio_device_load(VIRTIODevice *s, const uint8_t *buf, int len,
                        BOOL check_only)
 {
-    SnapReader r1, *r = &r1;
+    SnapReader r1, *r = &r1, device_r;
     uint32_t int_status, status, features_sel, queue_sel, config_size;
     QueueState queue[MAX_QUEUE];
     const uint8_t *config;
@@ -266,6 +277,9 @@ int virtio_device_load(VIRTIODevice *s, const uint8_t *buf, int len,
     if (config_size != s->config_space_size)
         return -1;
     config = snap_get_data(r, config_size);
+    device_r = *r;
+    if (s->device_load && s->device_load(s, r, TRUE) < 0)
+        return -1;
     if (!snap_reader_done(r) || queue_sel >= MAX_QUEUE)
         return -1;
     if (check_only)
@@ -276,6 +290,8 @@ int virtio_device_load(VIRTIODevice *s, const uint8_t *buf, int len,
     s->queue_sel = queue_sel;
     memcpy(s->queue, queue, sizeof(queue));
     memcpy(s->config_space, config, config_size);
+    if (s->device_load)
+        s->device_load(s, &device_r, FALSE);
     return 0;
 }
 
@@ -2828,3 +2844,419 @@ VIRTIODevice *virtio_9p_init(VIRTIOBusDef *bus, FSDevice *fs,
     return (VIRTIODevice *)s;
 }
 
+
+/*********************************************************************/
+/* GPIO controller (virtio-gpio, device ID 41) */
+
+#define VIRTIO_GPIO_F_IRQ 0
+
+#define VIRTIO_GPIO_MSG_GET_NAMES     0x0001
+#define VIRTIO_GPIO_MSG_GET_DIRECTION 0x0002
+#define VIRTIO_GPIO_MSG_SET_DIRECTION 0x0003
+#define VIRTIO_GPIO_MSG_GET_VALUE     0x0004
+#define VIRTIO_GPIO_MSG_SET_VALUE     0x0005
+#define VIRTIO_GPIO_MSG_IRQ_TYPE      0x0006
+
+#define VIRTIO_GPIO_STATUS_OK  0x0
+#define VIRTIO_GPIO_STATUS_ERR 0x1
+
+#define VIRTIO_GPIO_IRQ_TYPE_NONE         0x00
+#define VIRTIO_GPIO_IRQ_TYPE_EDGE_RISING  0x01
+#define VIRTIO_GPIO_IRQ_TYPE_EDGE_FALLING 0x02
+#define VIRTIO_GPIO_IRQ_TYPE_EDGE_BOTH    0x03
+#define VIRTIO_GPIO_IRQ_TYPE_LEVEL_HIGH   0x04
+#define VIRTIO_GPIO_IRQ_TYPE_LEVEL_LOW    0x08
+
+#define VIRTIO_GPIO_IRQ_STATUS_INVALID 0x0
+#define VIRTIO_GPIO_IRQ_STATUS_VALID   0x1
+
+typedef struct {
+    uint8_t direction;  /* GPIO_DIRECTION_x */
+    uint8_t value;      /* what it drives as an output */
+    uint8_t input;      /* the level driven from outside */
+    uint8_t irq_type;   /* VIRTIO_GPIO_IRQ_TYPE_x */
+    uint8_t latched;    /* an edge came while there was no buffer for it */
+    int event_desc;     /* eventq buffer waiting for an interrupt, or -1 */
+} GPIOLine;
+
+typedef struct VIRTIOGPIODevice {
+    VIRTIODevice common;
+    GPIOHost *host;
+    int count;
+    char **names;
+    uint8_t *names_block; /* the names, each NUL-terminated */
+    int names_size;
+    GPIOLine *lines;
+} VIRTIOGPIODevice;
+
+#define GPIO_STATE_VERSION 1
+
+static void gpio_notify(VIRTIOGPIODevice *s, int i)
+{
+    GPIOLine *l = &s->lines[i];
+    if (s->host && s->host->line_changed)
+        s->host->line_changed(s->host->opaque, i, s->names[i],
+                              l->direction, l->value, l->input);
+}
+
+/* the level the guest reads */
+static int gpio_level(GPIOLine *l)
+{
+    return l->direction == GPIO_DIRECTION_OUT ? l->value : l->input;
+}
+
+/* answer the line's eventq buffer, if it has one */
+static BOOL gpio_send_event(VIRTIOGPIODevice *s, int i, int status)
+{
+    GPIOLine *l = &s->lines[i];
+    uint8_t res = status;
+
+    if (l->event_desc < 0)
+        return FALSE;
+    memcpy_to_queue(&s->common, 1, l->event_desc, 0, &res, 1);
+    virtio_consume_desc(&s->common, 1, l->event_desc, 1);
+    l->event_desc = -1;
+    return TRUE;
+}
+
+/* a level interrupt that holds now */
+static BOOL gpio_level_irq(GPIOLine *l)
+{
+    if (l->direction == GPIO_DIRECTION_OUT)
+        return FALSE;
+    return (l->irq_type == VIRTIO_GPIO_IRQ_TYPE_LEVEL_HIGH && l->input) ||
+        (l->irq_type == VIRTIO_GPIO_IRQ_TYPE_LEVEL_LOW && !l->input);
+}
+
+/* a buffer came or the interrupt type changed: deliver what is due */
+static void gpio_check_irq(VIRTIOGPIODevice *s, int i)
+{
+    GPIOLine *l = &s->lines[i];
+
+    if (l->event_desc < 0)
+        return;
+    if (l->latched || gpio_level_irq(l)) {
+        l->latched = 0;
+        gpio_send_event(s, i, VIRTIO_GPIO_IRQ_STATUS_VALID);
+    }
+}
+
+static int virtio_gpio_recv_request(VIRTIODevice *s1, int queue_idx,
+                                    int desc_idx, int read_size,
+                                    int write_size)
+{
+    VIRTIOGPIODevice *s = (VIRTIOGPIODevice *)s1;
+    uint8_t req[8], res[2];
+    int type, i, value, old_dir, old_value;
+    GPIOLine *l;
+
+    if (queue_idx == 1) {
+        /* eventq: a buffer for the next interrupt of a line */
+        if (memcpy_from_queue(s1, req, 1, desc_idx, 0, 2) < 0 ||
+            (i = get_le16(req)) >= s->count) {
+            res[0] = VIRTIO_GPIO_IRQ_STATUS_INVALID;
+            memcpy_to_queue(s1, 1, desc_idx, 0, res, 1);
+            virtio_consume_desc(s1, 1, desc_idx, 1);
+            return 0;
+        }
+        l = &s->lines[i];
+        /* one buffer per line: give back an older one. It waits for the
+           interrupt (or for IRQ_TYPE NONE, which returns it) */
+        gpio_send_event(s, i, VIRTIO_GPIO_IRQ_STATUS_INVALID);
+        l->event_desc = desc_idx;
+        if (l->irq_type != VIRTIO_GPIO_IRQ_TYPE_NONE)
+            gpio_check_irq(s, i);
+        return 0;
+    }
+    if (queue_idx != 0)
+        return 0;
+
+    res[0] = VIRTIO_GPIO_STATUS_ERR;
+    res[1] = 0;
+    if (memcpy_from_queue(s1, req, 0, desc_idx, 0, sizeof(req)) < 0)
+        goto done;
+    type = get_le16(req);
+    i = get_le16(req + 2);
+    value = get_le32(req + 4);
+
+    if (type == VIRTIO_GPIO_MSG_GET_NAMES) {
+        uint8_t status = VIRTIO_GPIO_STATUS_OK;
+        if (write_size < 1 + s->names_size) {
+            status = VIRTIO_GPIO_STATUS_ERR;
+            memcpy_to_queue(s1, 0, desc_idx, 0, &status, 1);
+            virtio_consume_desc(s1, 0, desc_idx, 1);
+            return 0;
+        }
+        memcpy_to_queue(s1, 0, desc_idx, 0, &status, 1);
+        memcpy_to_queue(s1, 0, desc_idx, 1, s->names_block, s->names_size);
+        virtio_consume_desc(s1, 0, desc_idx, 1 + s->names_size);
+        return 0;
+    }
+    if (i >= s->count)
+        goto done;
+    l = &s->lines[i];
+    old_dir = l->direction;
+    old_value = l->value;
+
+    switch(type) {
+    case VIRTIO_GPIO_MSG_GET_DIRECTION:
+        res[1] = l->direction;
+        break;
+    case VIRTIO_GPIO_MSG_SET_DIRECTION:
+        if (value != GPIO_DIRECTION_NONE && value != GPIO_DIRECTION_OUT &&
+            value != GPIO_DIRECTION_IN)
+            goto done;
+        l->direction = value;
+        break;
+    case VIRTIO_GPIO_MSG_GET_VALUE:
+        res[1] = gpio_level(l);
+        break;
+    case VIRTIO_GPIO_MSG_SET_VALUE:
+        if (value > 1)
+            goto done;
+        l->value = value;
+        break;
+    case VIRTIO_GPIO_MSG_IRQ_TYPE:
+        if (value != VIRTIO_GPIO_IRQ_TYPE_NONE &&
+            value != VIRTIO_GPIO_IRQ_TYPE_EDGE_RISING &&
+            value != VIRTIO_GPIO_IRQ_TYPE_EDGE_FALLING &&
+            value != VIRTIO_GPIO_IRQ_TYPE_EDGE_BOTH &&
+            value != VIRTIO_GPIO_IRQ_TYPE_LEVEL_HIGH &&
+            value != VIRTIO_GPIO_IRQ_TYPE_LEVEL_LOW)
+            goto done;
+        l->irq_type = value;
+        l->latched = 0;
+        /* a disabled interrupt gives its buffer back */
+        if (value == VIRTIO_GPIO_IRQ_TYPE_NONE)
+            gpio_send_event(s, i, VIRTIO_GPIO_IRQ_STATUS_INVALID);
+        else
+            gpio_check_irq(s, i);
+        break;
+    default:
+        goto done;
+    }
+    res[0] = VIRTIO_GPIO_STATUS_OK;
+    if (l->direction != old_dir || l->value != old_value)
+        gpio_notify(s, i);
+ done:
+    memcpy_to_queue(s1, 0, desc_idx, 0, res, sizeof(res));
+    virtio_consume_desc(s1, 0, desc_idx, sizeof(res));
+    return 0;
+}
+
+/* Drive input line i from outside (a button). Edges are latched until the
+   driver has a buffer to report them in. */
+void virtio_gpio_set_input(VIRTIODevice *s1, int i, int level)
+{
+    VIRTIOGPIODevice *s = (VIRTIOGPIODevice *)s1;
+    GPIOLine *l;
+    BOOL edge;
+
+    if (i < 0 || i >= s->count)
+        return;
+    l = &s->lines[i];
+    level = level != 0;
+    if (l->input == level)
+        return;
+    l->input = level;
+    if (l->direction != GPIO_DIRECTION_OUT) {
+        switch(l->irq_type) {
+        case VIRTIO_GPIO_IRQ_TYPE_EDGE_RISING:
+            edge = level;
+            break;
+        case VIRTIO_GPIO_IRQ_TYPE_EDGE_FALLING:
+            edge = !level;
+            break;
+        case VIRTIO_GPIO_IRQ_TYPE_EDGE_BOTH:
+            edge = TRUE;
+            break;
+        default:
+            edge = FALSE;
+            break;
+        }
+        if (edge)
+            l->latched = 1;
+        gpio_check_irq(s, i);
+    }
+    gpio_notify(s, i);
+}
+
+/* the lines go back to unused (and the LEDs off); what is driven from
+   outside stays */
+static void virtio_gpio_reset(VIRTIODevice *s1)
+{
+    VIRTIOGPIODevice *s = (VIRTIOGPIODevice *)s1;
+    int i;
+
+    for(i = 0; i < s->count; i++) {
+        GPIOLine *l = &s->lines[i];
+        BOOL changed = l->direction != GPIO_DIRECTION_NONE || l->value != 0;
+        l->direction = GPIO_DIRECTION_NONE;
+        l->value = 0;
+        l->irq_type = VIRTIO_GPIO_IRQ_TYPE_NONE;
+        l->latched = 0;
+        l->event_desc = -1; /* the queues are gone */
+        if (changed)
+            gpio_notify(s, i);
+    }
+}
+
+static void virtio_gpio_save(VIRTIODevice *s1, SnapWriter *w)
+{
+    VIRTIOGPIODevice *s = (VIRTIOGPIODevice *)s1;
+    int i;
+
+    snap_put_u32(w, GPIO_STATE_VERSION);
+    snap_put_u32(w, s->count);
+    for(i = 0; i < s->count; i++) {
+        GPIOLine *l = &s->lines[i];
+        snap_put_u32(w, l->direction | (l->value << 8) | (l->input << 16) |
+                     (l->latched << 24));
+        snap_put_u32(w, l->irq_type);
+        snap_put_u32(w, (uint32_t)l->event_desc);
+    }
+}
+
+static int virtio_gpio_load(VIRTIODevice *s1, SnapReader *r, BOOL check_only)
+{
+    VIRTIOGPIODevice *s = (VIRTIOGPIODevice *)s1;
+    uint32_t v, irq_type;
+    int32_t desc;
+    int i;
+
+    if (snap_get_u32(r) != GPIO_STATE_VERSION ||
+        snap_get_u32(r) != s->count)
+        return -1;
+    for(i = 0; i < s->count; i++) {
+        v = snap_get_u32(r);
+        irq_type = snap_get_u32(r);
+        desc = (int32_t)snap_get_u32(r);
+        if ((v & 0xff) > GPIO_DIRECTION_IN || irq_type > 0xff ||
+            desc >= MAX_QUEUE_NUM || desc < -1)
+            return -1;
+        if (!check_only) {
+            GPIOLine *l = &s->lines[i];
+            l->direction = v & 0xff;
+            l->value = (v >> 8) & 1;
+            l->input = (v >> 16) & 1;
+            l->latched = (v >> 24) & 1;
+            l->irq_type = irq_type;
+            l->event_desc = desc;
+            gpio_notify(s, i);
+        }
+    }
+    return 0;
+}
+
+VIRTIODevice *virtio_gpio_init(VIRTIOBusDef *bus, GPIOHost *host,
+                               char **names, int count)
+{
+    VIRTIOGPIODevice *s;
+    uint8_t *p;
+    int i;
+
+    s = mallocz(sizeof(*s));
+    virtio_init(&s->common, bus, 41, 8, virtio_gpio_recv_request);
+    s->common.device_features = 1 << VIRTIO_GPIO_F_IRQ;
+    s->common.device_reset = virtio_gpio_reset;
+    s->common.device_save = virtio_gpio_save;
+    s->common.device_load = virtio_gpio_load;
+    s->host = host;
+    s->count = count;
+    s->names = mallocz(sizeof(s->names[0]) * count);
+    s->lines = mallocz(sizeof(s->lines[0]) * count);
+    s->names_size = 0;
+    for(i = 0; i < count; i++) {
+        s->names[i] = strdup(names[i]);
+        s->names_size += strlen(names[i]) + 1;
+        s->lines[i].event_desc = -1;
+    }
+    s->names_block = p = malloc(s->names_size);
+    for(i = 0; i < count; i++) {
+        strcpy((char *)p, names[i]);
+        p += strlen(names[i]) + 1;
+    }
+    put_le16(s->common.config_space, count);
+    put_le32(s->common.config_space + 4, s->names_size);
+    /* tell the host about the lines */
+    for(i = 0; i < count; i++)
+        gpio_notify(s, i);
+    return (VIRTIODevice *)s;
+}
+
+/*********************************************************************/
+/* I2C adapter (virtio-i2c, device ID 34) */
+
+#define VIRTIO_I2C_F_ZERO_LENGTH_REQUEST 0
+#define VIRTIO_I2C_FLAGS_FAIL_NEXT (1 << 0)
+#define VIRTIO_I2C_FLAGS_M_RD      (1 << 1)
+#define VIRTIO_I2C_MSG_OK  0
+#define VIRTIO_I2C_MSG_ERR 1
+
+typedef struct VIRTIOI2CDevice {
+    VIRTIODevice common;
+    I2CHost *host;
+    BOOL fail_next; /* the previous message failed and had FAIL_NEXT */
+} VIRTIOI2CDevice;
+
+/* one request is one I2C message: a header, its data (from the driver for
+   a write, to it for a read) and a status byte */
+static int virtio_i2c_recv_request(VIRTIODevice *s1, int queue_idx,
+                                   int desc_idx, int read_size,
+                                   int write_size)
+{
+    VIRTIOI2CDevice *s = (VIRTIOI2CDevice *)s1;
+    uint8_t hdr[8], status = VIRTIO_I2C_MSG_ERR, *buf = NULL;
+    uint32_t flags = 0;
+    int addr, len, in_len;
+    BOOL is_read;
+
+    if (write_size < 1) {
+        /* nowhere to put the status */
+        virtio_consume_desc(s1, 0, desc_idx, 0);
+        return 0;
+    }
+    in_len = write_size - 1; /* the data the driver reads */
+    if (read_size < 8 ||
+        memcpy_from_queue(s1, hdr, 0, desc_idx, 0, sizeof(hdr)) < 0)
+        goto done;
+    addr = get_le16(hdr) >> 1;
+    flags = get_le32(hdr + 4);
+    is_read = (flags & VIRTIO_I2C_FLAGS_M_RD) != 0;
+    if (is_read ? read_size != 8 : in_len != 0)
+        goto done;
+    len = is_read ? in_len : read_size - 8;
+    buf = mallocz(max_int(len, 1));
+    if (!is_read && len > 0 &&
+        memcpy_from_queue(s1, buf, 0, desc_idx, 8, len) < 0)
+        goto done;
+    if (!s->fail_next && s->host && s->host->transfer &&
+        s->host->transfer(s->host->opaque, addr, is_read, buf, len) == 0)
+        status = VIRTIO_I2C_MSG_OK;
+    if (is_read && len > 0)
+        memcpy_to_queue(s1, 0, desc_idx, 0, buf, len);
+ done:
+    memcpy_to_queue(s1, 0, desc_idx, in_len, &status, 1);
+    virtio_consume_desc(s1, 0, desc_idx, in_len + 1);
+    free(buf);
+    s->fail_next = (flags & VIRTIO_I2C_FLAGS_FAIL_NEXT) &&
+        status != VIRTIO_I2C_MSG_OK;
+    return 0;
+}
+
+static void virtio_i2c_reset(VIRTIODevice *s1)
+{
+    ((VIRTIOI2CDevice *)s1)->fail_next = FALSE;
+}
+
+VIRTIODevice *virtio_i2c_init(VIRTIOBusDef *bus, I2CHost *host)
+{
+    VIRTIOI2CDevice *s;
+
+    s = mallocz(sizeof(*s));
+    virtio_init(&s->common, bus, 34, 0, virtio_i2c_recv_request);
+    s->common.device_features = 1 << VIRTIO_I2C_F_ZERO_LENGTH_REQUEST;
+    s->common.device_reset = virtio_i2c_reset;
+    s->host = host;
+    return (VIRTIODevice *)s;
+}

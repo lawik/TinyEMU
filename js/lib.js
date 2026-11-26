@@ -605,6 +605,39 @@ mergeInto(LibraryManager.library, {
           }) });
   },
 
+  /* GPIO lines and I2C devices live in the page:
+     Module.onGpio({line, name, direction, value, input}) when the guest
+     changes a line (direction "none", "out" or "in"; every line once when
+     the machine is created), and Module.onI2C(address, isRead, data) for
+     each I2C message: fill data (a Uint8Array) for a read, or take it for
+     a write; return true if a device answered. The page drives inputs with
+     _gpio_set_input(line, level). */
+  gpio_line_changed: function(line, name, direction, value, input)
+  {
+      if (Module.onGpio)
+          Module.onGpio({ line: line, name: UTF8ToString(name),
+                          direction: ["none", "out", "in"][direction] || "none",
+                          value: value, input: input });
+  },
+
+  i2c_transfer: function(address, is_read, buf, len)
+  {
+      var data;
+      if (!Module.onI2C)
+          return -1;
+      data = is_read ? new Uint8Array(len) : HEAPU8.slice(buf, buf + len);
+      try {
+          if (!Module.onI2C(address, !!is_read, data))
+              return -1;
+      } catch (e) {
+          console.error(e);
+          return -1;
+      }
+      if (is_read)
+          HEAPU8.set(data.subarray(0, len), buf);
+      return 0;
+  },
+
   disk_wait_wanted: function()
   {
       return Module.waitForDisk === false ? 0 : 1;

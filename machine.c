@@ -223,7 +223,7 @@ static const VirtMachineClass *virt_machine_find_class(const char *machine_name)
 static int virt_machine_parse_config(VirtMachineParams *p,
                                      char *config_file_str, int len)
 {
-    int version, val;
+    int version, val, i;
     const char *tag_name, *str;
     char buf1[256];
     JSONValue cfg, obj, el;
@@ -368,6 +368,25 @@ static int virt_machine_parse_config(VirtMachineParams *p,
             p->files[VM_FILE_VGA_BIOS].filename = strdup(str);
         }
     }
+
+    obj = json_object_get(cfg, "gpio0");
+    if (!json_is_undefined(obj)) {
+        JSONValue lines = json_object_get(obj, "lines");
+        if (lines.type != JSON_ARRAY) {
+            vm_error("gpio0: lines: array expected\n");
+            goto tag_fail;
+        }
+        for(i = 0; i < lines.u.array->len; i++) {
+            el = json_array_get(lines, i);
+            if (el.type != JSON_STR || p->gpio_count >= MAX_GPIO_LINES) {
+                vm_error("gpio0: lines: at most %d names\n", MAX_GPIO_LINES);
+                goto tag_fail;
+            }
+            p->gpio_names[p->gpio_count++] = strdup(el.u.str->data);
+        }
+    }
+    if (!json_is_undefined(json_object_get(cfg, "i2c0")))
+        p->i2c_enable = TRUE;
 
     if (vm_get_str_opt(cfg, "input_device", &str) < 0)
         goto tag_fail;
@@ -618,6 +637,8 @@ void virt_machine_free_config(VirtMachineParams *p)
         free(p->tab_eth[i].driver);
         free(p->tab_eth[i].ifname);
     }
+    for(i = 0; i < p->gpio_count; i++)
+        free(p->gpio_names[i]);
     free(p->input_device);
     free(p->display_device);
     free(p->cfg_filename);

@@ -43,6 +43,7 @@ struct FBDevice {
 #define MAX_DRIVE_DEVICE 4
 #define MAX_FS_DEVICE 4
 #define MAX_ETH_DEVICE 1
+#define MAX_GPIO_LINES 32
 
 #define VM_CONFIG_VERSION 1
 
@@ -102,6 +103,14 @@ typedef struct {
     char *cmdline; /* bios or kernel command line */
     BOOL accel_enable; /* enable acceleration (KVM) */
     char *input_device; /* NULL means no input */
+
+    /* GPIO controller ("gpio0": { lines: [names] }) and I2C adapter
+       ("i2c0": {}); the frontend sets the hosts (the outside world) */
+    char *gpio_names[MAX_GPIO_LINES];
+    int gpio_count;
+    BOOL i2c_enable;
+    GPIOHost *gpio_host;
+    I2CHost *i2c_host;
     
     /* kernel, bios and other auxiliary files */
     VMFileEntry files[VM_FILE_COUNT];
@@ -122,6 +131,8 @@ typedef struct VirtMachine {
     BOOL (*console_input_wanted)(struct VirtMachine *m);
     /* graphics */
     FBDevice *fb_dev;
+    /* GPIO controller, if any */
+    VIRTIODevice *gpio_dev;
 } VirtMachine;
 
 /* console input helpers for the frontends */

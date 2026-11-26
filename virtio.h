@@ -135,6 +135,38 @@ int virtio_console_get_write_len(VIRTIODevice *s);
 int virtio_console_write_data(VIRTIODevice *s, const uint8_t *buf, int buf_len);
 void virtio_console_resize_event(VIRTIODevice *s, int width, int height);
 
+/* GPIO controller (virtio-gpio) */
+
+#define GPIO_DIRECTION_NONE 0 /* not in use */
+#define GPIO_DIRECTION_OUT  1
+#define GPIO_DIRECTION_IN   2
+
+typedef struct {
+    void *opaque;
+    /* line i changed (or is announced, when the device is created): its
+       direction, the value it drives as an output and the level driven
+       from outside (virtio_gpio_set_input) */
+    void (*line_changed)(void *opaque, int i, const char *name,
+                         int direction, int value, int input);
+} GPIOHost;
+
+VIRTIODevice *virtio_gpio_init(VIRTIOBusDef *bus, GPIOHost *host,
+                               char **names, int count);
+void virtio_gpio_set_input(VIRTIODevice *s, int i, int level);
+
+/* I2C adapter (virtio-i2c) */
+
+typedef struct {
+    void *opaque;
+    /* one message to the device at the 7-bit address addr: fill buf with
+       len bytes (is_read) or take them. 0 if the device acknowledged, -1
+       if nothing answered */
+    int (*transfer)(void *opaque, int addr, BOOL is_read, uint8_t *buf,
+                    int len);
+} I2CHost;
+
+VIRTIODevice *virtio_i2c_init(VIRTIOBusDef *bus, I2CHost *host);
+
 /* input device */
 
 typedef enum {
