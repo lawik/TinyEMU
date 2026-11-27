@@ -104,6 +104,7 @@ typedef struct BlockDeviceHTTP {
 
     /* current read request */
     BOOL is_write;
+    BOOL busy; /* a guest request waits for a block to load */
     uint64_t sector_num;
     int cur_block_num;
     int sector_index, sector_count;
@@ -493,6 +494,7 @@ static int bf_rw_async1(BlockDevice *bs, BOOL is_sync)
     if (!is_sync) {
         //        printf("end of request\n");
         /* end of request */
+        bf->busy = FALSE;
         bf->cb(bf->opaque, 0);
     } 
     return 0;
@@ -552,7 +554,8 @@ static int bf_read_async(BlockDevice *bs,
     bf->cb = cb;
     bf->opaque = opaque;
     bf->n_read_sectors += n;
-    return bf_rw_async1(bs, TRUE);
+    bf->busy = bf_rw_async1(bs, TRUE) > 0;
+    return bf->busy;
 }
 
 static int bf_write_async(BlockDevice *bs,
@@ -569,7 +572,43 @@ static int bf_write_async(BlockDevice *bs,
     bf->cb = cb;
     bf->opaque = opaque;
     bf->n_write_sectors += n;
-    return bf_rw_async1(bs, TRUE);
+    bf->busy = bf_rw_async1(bs, TRUE) > 0;
+    return bf->busy;
+}
+
+/* A write from the host's side: the page puts a file (a firmware update)
+   into a part of the disk that the guest then reads. It goes the way of a
+   guest write, so it is persisted like one. Only where nothing has to be
+   loaded for it: clusters that are written already and blocks that are all
+   zeros, which is what a scratch area after the last partition is.
+   Returns 0, -1 while a guest request waits for a block (try again), -2
+   outside the disk, -3 where a block would have to be loaded. */
+int block_net_host_write(BlockDevice *bs, uint64_t sector_num,
+                         const uint8_t *buf, int n)
+{
+    BlockDeviceHTTP *bf = bs->opaque;
+    uint64_t s;
+
+    if (bf->busy)
+        return -1;
+    if (n <= 0 || sector_num + n > (uint64_t)bf->nb_sectors)
+        return -2;
+    for(s = sector_num; s < sector_num + n;
+        s = (s / bf->sectors_per_cluster + 1) * bf->sectors_per_cluster) {
+        if (!bf->clusters[s / bf->sectors_per_cluster] &&
+            !bf_block_is_zero(bf, s / bf->block_size))
+            return -3;
+    }
+    bf->is_write = TRUE;
+    bf->sector_num = sector_num;
+    bf->io_buf = (uint8_t *)buf;
+    bf->sector_count = n;
+    bf->sector_index = 0;
+    bf->cb = NULL;
+    bf->opaque = NULL;
+    bf_rw_async1(bs, TRUE);
+    bf->cur_block_num = -1;
+    return 0;
 }
 
 BlockDevice *block_device_init_http(const char *url,

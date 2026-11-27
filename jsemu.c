@@ -268,6 +268,15 @@ static int js_i2c_transfer(void *opaque, int address, BOOL is_read,
 static GPIOHost js_gpio_host = { NULL, js_gpio_line_changed };
 static I2CHost js_i2c_host = { NULL, js_i2c_transfer };
 
+/* the page writes n_sectors of 512 bytes to the disk, from sector_num on
+   (see block_net_host_write); -4 without a disk */
+int disk_write(int sector_num, const uint8_t *buf, int n_sectors)
+{
+    if (!global_drive)
+        return -4;
+    return block_net_host_write(global_drive, sector_num, buf, n_sectors);
+}
+
 /* the page drives a GPIO input (a button) */
 void gpio_set_input(int line, int level)
 {

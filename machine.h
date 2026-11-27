@@ -229,6 +229,8 @@ BlockDevice *block_device_init_http(const char *url,
                                     void (*start_cb)(void *opaque),
                                     void *start_opaque);
 const char *block_net_get_snapshot_url(BlockDevice *bs);
+int block_net_host_write(BlockDevice *bs, uint64_t sector_num,
+                         const uint8_t *buf, int n);
 int block_net_get_snapshot_size(BlockDevice *bs);
 void block_net_start_prefetch(BlockDevice *bs, BOOL yield_to_guest,
                               void (*ready_cb)(void *opaque), void *opaque);
